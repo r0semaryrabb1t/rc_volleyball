@@ -3,8 +3,8 @@
 joystick_control_node:
   ros__parameters:
     # 速度限制（应与底盘控制节点一致）
-    max_linear_velocity: 0.15      # 最大线速度 (m/s) - 对应约2500 RPM电机转速
-    max_angular_velocity: 0.15     # 最大角速度 (rad/s)
+    max_linear_velocity: 0.1     # 最大线速度 (m/s) - 对应约800 RPM电机转速
+    max_angular_velocity: 0.1     # 最大角速度 (rad/s)
     
     # 摇杆参数
     deadzone: 0.05                  # 摇杆死区 [0, 1] - 降低以提高精细度
@@ -12,8 +12,8 @@ joystick_control_node:
     
     # 控制参数
     publish_rate: 50.0              # 发布频率 (Hz)
-    accel_limit: 10.0               # 线性加速度限制 (m/s²) - 提高以减少延迟
-    angular_accel_limit: 10.0       # 角加速度限制 (rad/s²) - 提高以减少延迟
+    accel_limit: 0.5                # 线性加速度限制 (m/s²) - 降低使启动更柔和
+    angular_accel_limit: 0.5        # 角加速度限制 (rad/s²) - 降低使启动更柔和
     joy_timeout: 0.5                # 手柄超时时间 (s)
     
     # 速度模式增益（可通过按钮切换）
