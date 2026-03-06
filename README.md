@@ -6,14 +6,14 @@ ROS2 电机控制系统，支持多种电机类型的实时控制和监控。
 
 ### 支持的电机
 
-| 电机型号 | 通信接口 | 控制模式 |
-|---------|---------|---------|
-| DJI GM6020 | CAN | 电压控制 |
-| DJI GM3508 | CAN | 电流控制 |
-| 达妙 DM4340 | CAN | MIT 模式 |
-| 达妙 DM4310 | CAN | MIT 模式 |
-| 宇树 A1 | RS485 | 力位混合 |
-| 宇树 GO-8010 | RS485 | 力位混合 |
+| 电机型号 | 通信接口 | 控制模式 | 文档 |
+|---------|---------|---------|------|
+| DJI GM6020 | CAN | 电压控制 | |
+| DJI GM3508 | CAN | 电流控制 | |
+| 达妙 DM4340 | CAN | MIT 模式 | |
+| 达妙 DM4310 | CAN | MIT 模式 | |
+| 宇树 A1 | RS485 | 力位混合 | |
+| 宇树 GO-8010 | RS485 | 力位混合 | [文档](./doc/unitree_8010.md) |
 
 ### 系统架构
 
@@ -401,6 +401,7 @@ ros2 run motor_control_ros2 motor_control_node
 - `.agent/yaml_config_guide.md` - YAML 配置详细指南
 - `.agent/refactor_complete.md` - 系统重构总结
 - `.agent/chassis_motor_calibration.md` - 底盘电机零位和方向标定指南
+- `./doc/unitree_8010.md` - 宇树 GO-8010 电机使用指南
 - `src/motor_control_ros2/config/motors.yaml` - 电机配置示例
 - `src/motor_control_ros2/config/chassis_params.yaml` - 底盘参数配置
 
