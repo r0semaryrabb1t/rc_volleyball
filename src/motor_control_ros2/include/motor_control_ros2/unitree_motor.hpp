@@ -22,7 +22,7 @@ public:
   void enable() override;
   void disable() override;
 
-  void setHybridCommand(float pos, float vel, float kp, float kd, float torque);
+  void setHybridCommand(float pos, float vel, float kp, float kd, float torque, uint8_t mode);
 
   bool sendRecv();
 

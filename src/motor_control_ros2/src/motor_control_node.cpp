@@ -636,7 +636,7 @@ private:
     if (it != motors_.end()) {
       auto motor = std::dynamic_pointer_cast<UnitreeMotor>(it->second);
       if (motor) {
-        motor->setHybridCommand(msg->pos_des, msg->vel_des, msg->kp, msg->kd, msg->torque_ff);
+        motor->setHybridCommand(msg->pos_des, msg->vel_des, msg->kp, msg->kd, msg->torque_ff, msg->mode);
       }
     }
   }
@@ -646,7 +646,7 @@ private:
     if (it != motors_.end()) {
       auto motor = std::dynamic_pointer_cast<UnitreeMotor>(it->second);
       if (motor) {
-        motor->setHybridCommand(msg->pos_des, msg->vel_des, msg->kp, msg->kd, msg->torque_ff);
+        motor->setHybridCommand(msg->pos_des, msg->vel_des, msg->kp, msg->kd, msg->torque_ff, msg->mode);
       }
     }
   }

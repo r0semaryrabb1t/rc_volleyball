@@ -49,11 +49,11 @@ void UnitreeMotor::disable() {
   sdk_cmd_.tau = 0.0f;
 }
 
-void UnitreeMotor::setHybridCommand(float pos, float vel, float kp, float kd, float torque) {
+void UnitreeMotor::setHybridCommand(float pos, float vel, float kp, float kd, float torque, uint8_t mode) {
   sdk_cmd_.kp = kp;
   sdk_cmd_.kd = kd;
   sdk_cmd_.tau = torque;
-
+  sdk_cmd_.mode = mode;
   sdk_cmd_.q = pos / gear_ratio_;
   sdk_cmd_.dq = vel / gear_ratio_;
 }
