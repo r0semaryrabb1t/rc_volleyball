@@ -94,6 +94,23 @@ public:
     * @return 成功返回 true
     */
    bool sendRecv(const uint8_t* send_data, size_t send_len, uint8_t* recv_buffer, size_t recv_len);
+
+   /**
+    * @brief 请求-响应模式的发送接收（适用于宇树电机等半双工协议）
+    *
+    * 流程: 发送数据 → 等待 wait_ms → 累积接收数据直到 max_len 或超时
+    *
+    * @param send_data 发送数据
+    * @param send_len 发送数据长度
+    * @param recv_buffer 接收缓冲区（大小应 >= max_len）
+    * @param max_len 最大接收长度（缓冲区上限）
+    * @param wait_ms 发送后等待时间（毫秒）
+    * @param timeout_ms 接收超时时间（毫秒）
+    * @return 实际收到的字节数；-1 表示发送失败；0 表示超时无数据
+    */
+   ssize_t sendRecvAccumulate(const uint8_t* send_data, size_t send_len,
+                              uint8_t* recv_buffer, size_t max_len,
+                              int wait_ms = 10, int timeout_ms = 20);
    
    /**
     * @brief 设置 RS485 方向控制

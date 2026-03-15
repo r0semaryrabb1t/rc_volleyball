@@ -69,7 +69,7 @@ class MotorControlNode : public rclcpp::Node {
 public:
   MotorControlNode() : Node("motor_control_node") {
     // 声明参数（使用 200Hz 作为默认值，与 Python 一致）
-    this->declare_parameter("control_frequency", 2.0);
+    this->declare_parameter("control_frequency", 200.0);
     this->declare_parameter("config_file", "");
     
     // 尝试从 control_params.yaml 加载控制参数
@@ -147,6 +147,7 @@ public:
     
     // 初始化频率统计
     last_freq_report_time_ = this->now();
+    last_dji_tx_report_time_ = this->now();
     
     RCLCPP_INFO(this->get_logger(), "电机控制节点已启动 - 控制频率: %.1f Hz, 宇树电机(原生): %zu",
                 control_freq, unitree_native_motors_.size());
@@ -188,12 +189,10 @@ private:
         RCLCPP_ERROR(this->get_logger(), "无法打开串口: %s", serial_config.device.c_str());
         continue;
       }
-      
-      auto serial_if = serial_network_->getInterface(interface_name);
-      
+
       // 添加电机
       for (const auto& motor_config : serial_config.motors) {
-        addUnitreeNativeMotorFromConfig(motor_config, serial_if, interface_name);
+        addUnitreeNativeMotorFromConfig(motor_config, interface_name, serial_config.device);
       }
     }
     
@@ -205,29 +204,24 @@ private:
    * @brief 从配置添加宇树电机（原生协议，不依赖SDK）
    */
   void addUnitreeNativeMotorFromConfig(const MotorConfig& config,
-                                       std::shared_ptr<hardware::SerialInterface> serial,
-                                       const std::string& interface_name) {
+                                       const std::string& interface_name,
+                                       const std::string& device_path) {
     auto motor = std::make_shared<UnitreeMotorNative>(
-      config.name, 
+      config.name,
       static_cast<uint8_t>(config.id),
-      config.direction, 
-      config.offset,
-      config.gear_ratio, 
-      config.k_pos, 
-      config.k_spd
+      config.gear_ratio
     );
-    
-    motor->setSerialInterface(serial);
+
     motor->setInterfaceName(interface_name);
-    
+    motor->setDevicePath(device_path);
+
     motors_[config.name] = motor;
     unitree_native_motors_.push_back(motor);
-    
-    RCLCPP_INFO(this->get_logger(), 
-                "添加宇树电机(原生): %s (ID=%d, 方向=%d, 齿轮比=%.2f, k_pos=%.2f, k_spd=%.2f) -> %s",
-                config.name.c_str(), config.id, config.direction, 
-                config.gear_ratio, config.k_pos, config.k_spd,
-                interface_name.c_str());
+
+    RCLCPP_INFO(this->get_logger(),
+                "添加宇树电机(原生): %s (ID=%d, 齿轮比=%.2f) -> %s",
+                config.name.c_str(), config.id,
+                config.gear_ratio, interface_name.c_str());
   }
 
   /**
@@ -400,16 +394,68 @@ private:
   
   /**
    * @brief 写入宇树电机命令（原生协议）
+   *
+   * 分层架构（对齐 CAN 侧 DJIMotor + CANInterface）：
+   * 1. 协议层（UnitreeMotorNative）：构建命令包
+   * 2. 硬件层（SerialInterface）：发送接收
+   * 3. 协议层（UnitreeMotorNative）：解析反馈包
    */
   void writeUnitreeNativeMotors() {
+    constexpr size_t FRAME_LEN = 16;    // 宇树 GO-M8010-6 反馈帧固定长度
+    constexpr size_t BUF_SIZE  = 48;    // 留余量：16字节帧 + 最多32字节噪声前缀
+
     for (auto& motor : unitree_native_motors_) {
-       static int debug_count = 0;
-      if(motor->sendRecv()){ // 发送并接收反馈
-      
-      // 调试日志
-      static int debug_count = 0;
-      if (++debug_count % 100 == 0) {
-        RCLCPP_INFO(this->get_logger(), 
+      auto serial = serial_network_->getInterface(motor->getInterfaceName());
+      if (!serial || !serial->isOpen()) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "[UnitreeNative] %s: 串口未就绪 (%s)",
+                            motor->getJointName().c_str(), motor->getInterfaceName().c_str());
+        continue;
+      }
+
+      // 协议层：构建命令包
+      uint8_t cmd[17];
+      motor->getCommandPacket(cmd);
+
+      // 尝试一次发送接收 + 帧扫描解析
+      // 返回 true 表示成功解析到一帧有效反馈
+      // 注意：max_len 传入 FRAME_LEN 而非 BUF_SIZE，收到完整16字节帧即退出
+      //       wait_ms=2：4Mbps 下命令发送+电机处理约 1-2ms
+      //       timeout_ms=8：8ms 墙钟超时，远小于控制周期 5ms×n
+      auto try_recv_parse = [&](uint8_t (&buf)[BUF_SIZE]) -> bool {
+        ssize_t n = serial->sendRecvAccumulate(cmd, 17, buf, FRAME_LEN, 2, 8);
+        if (n <= 0) return false;
+
+        // 帧扫描：在收到的数据中搜索 0xFD 0xEE 帧头
+        for (ssize_t off = 0; off + static_cast<ssize_t>(FRAME_LEN) <= n; ++off) {
+          if (buf[off] == 0xFD && buf[off + 1] == 0xEE) {
+            if (motor->parseFeedback(&buf[off], FRAME_LEN)) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+
+      uint8_t response[BUF_SIZE];
+      bool ok = try_recv_parse(response);
+
+      if (!ok) {
+        // 热插拔恢复：重试 1 次（flush 已在 sendRecvAccumulate 内部执行）
+        bool recovered = try_recv_parse(response);
+        if (recovered) {
+          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                              "[UnitreeNative] %s: [HOT_PLUG] 热插拔恢复成功（重试1次）",
+                              motor->getJointName().c_str());
+          ok = true;
+        } else {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                              "[UnitreeNative] %s: 通信失败", motor->getJointName().c_str());
+        }
+      }
+
+      if (ok) {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                     "[UnitreeNative] %s: Pos=%.3f° Vel=%.3f rad/s Tor=%.3f Nm Tmp=%d°C Online=%d",
                     motor->getJointName().c_str(),
                     motor->getOutputPosition() * 180.0 / M_PI,
@@ -418,11 +464,6 @@ private:
                     (int)motor->getTemperature(),
                     motor->isOnline() ? 1 : 0);
       }
-      } else {if (++debug_count % 100 == 0){
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                            "[UnitreeNative] %s: 发送或接收失败", motor->getJointName().c_str());
-      }
-    }
     }
   }
   
@@ -430,17 +471,15 @@ private:
     if (dji_motors_.empty()) 
     {return;}
     
-    // 发送频率统计
-    static int tx_count = 0;
-    static auto last_tx_report = this->now();
-    tx_count++;
+    // 发送频率统计（使用成员变量，避免 static 在多接口下不独立）
+    dji_tx_count_++;
     
     auto now_tx = this->now();
-    double dt_tx = (now_tx - last_tx_report).seconds();
+    double dt_tx = (now_tx - last_dji_tx_report_time_).seconds();
     if (dt_tx >= 1.0) {  // 每秒更新一次
-      actual_can_tx_freq_ = tx_count / dt_tx;
-      tx_count = 0;
-      last_tx_report = now_tx;
+      actual_can_tx_freq_ = dji_tx_count_ / dt_tx;
+      dji_tx_count_ = 0;
+      last_dji_tx_report_time_ = now_tx;
     }
     
     // DJI 电机需要拼包发送
@@ -509,7 +548,7 @@ private:
           
           damiao->getControlFrame(can_id, data, len);
           if (len > 0) {
-            can_network_->send("can0", can_id, data, len);
+            can_network_->send(damiao->getInterfaceName(), can_id, data, len);
           }
         }
       }
@@ -572,11 +611,13 @@ private:
       auto msg = motor_control_ros2::msg::UnitreeGO8010State();
       msg.header.stamp = now;
       msg.joint_name = motor->getJointName();
+      msg.motor_id = motor->getMotorId();
       msg.online = motor->isOnline();
       msg.position = motor->getOutputPosition();
       msg.velocity = motor->getOutputVelocity();
       msg.torque = motor->getOutputTorque();
       msg.temperature = static_cast<int8_t>(motor->getTemperature());
+      msg.error = motor->getErrorCode();
       unitree_go_state_pub_->publish(msg);
     }
     
@@ -626,50 +667,66 @@ private:
   }
 
   void unitreeGOCommandCallback(const motor_control_ros2::msg::UnitreeGO8010Command::SharedPtr msg) {
-    auto it = motors_.find(msg->joint_name);
-    if (it == motors_.end()) {
-      RCLCPP_WARN(this->get_logger(), "[CMD GO8010] 未找到电机: %s", msg->joint_name.c_str());
+    // 按 ID（和可选的 device）在原生宇树电机列表中查找
+    std::vector<std::shared_ptr<UnitreeMotorNative>> matched_motors;
+    for (auto& m : unitree_native_motors_) {
+      if (m->getMotorId() == msg->id) {
+        // 如果指定了 device，只匹配该设备上的电机
+        if (!msg->device.empty() && m->getDevicePath() != msg->device) {
+          continue;
+        }
+        matched_motors.push_back(m);
+      }
+    }
+
+    if (matched_motors.empty()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "[CMD GO8010] 未找到电机 ID=%d device='%s'（可能该 ID 未接线或未在 motors.yaml 配置）",
+                           msg->id, msg->device.c_str());
       return;
     }
-    
-    // 首先尝试原生协议电机
-    auto native_motor = std::dynamic_pointer_cast<UnitreeMotorNative>(it->second);
-    if (native_motor) {
-      // 根据控制模式设置命令
-      switch (msg->mode) {
-        case 0:  // MODE_BRAKE
-          native_motor->setBrakeCommand();
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                               "[CMD GO8010 Native] %s 刹车模式", msg->joint_name.c_str());
-          break;
 
-        case 1:  // MODE_FOC
+    if (matched_motors.size() > 1 && msg->device.empty()) {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "[CMD GO8010] ID=%d 对应 %zu 台电机（多串口同 ID，未指定 device），广播下发",
+                           msg->id, matched_motors.size());
+    }
+
+    // 根据控制模式设置命令
+    switch (msg->mode) {
+      case 0:  // MODE_BRAKE
+        for (auto& native_motor : matched_motors) {
+          native_motor->setBrakeCommand();
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "[CMD GO8010 Native] ID=%d 刹车模式", msg->id);
+        break;
+
+      case 1:  // MODE_FOC
+        for (auto& native_motor : matched_motors) {
           native_motor->setFOCCommand(msg->position_target, msg->velocity_target,
                               msg->kp, msg->kd, msg->torque_ff);
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                               "[CMD GO8010 Native] %s FOC: pos=%.2f°, vel=%.2f rad/s, kp=%.2f, kd=%.2f, tau=%.3f",
-                               msg->joint_name.c_str(),
-                               msg->position_target * 180.0 / M_PI,
-                               msg->velocity_target, msg->kp, msg->kd, msg->torque_ff);
-          break;
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "[CMD GO8010 Native] ID=%d FOC: pos=%.2f°, vel=%.2f rad/s, kp=%.2f, kd=%.2f, tau=%.3f",
+                             msg->id,
+                             msg->position_target * 180.0 / M_PI,
+                             msg->velocity_target, msg->kp, msg->kd, msg->torque_ff);
+        break;
 
-        case 2:  // MODE_CALIBRATE
+      case 2:  // MODE_CALIBRATE
+        for (auto& native_motor : matched_motors) {
           native_motor->setCalibrateCommand();
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                               "[CMD GO8010 Native] %s 校准模式", msg->joint_name.c_str());
-          break;
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "[CMD GO8010 Native] ID=%d 校准模式", msg->id);
+        break;
 
-        default:
-          RCLCPP_WARN(this->get_logger(), "[CMD GO8010 Native] %s 未知模式: %d",
-                     msg->joint_name.c_str(), msg->mode);
-          break;
-      }
-      return;
+      default:
+        RCLCPP_WARN(this->get_logger(), "[CMD GO8010 Native] ID=%d 未知模式: %d",
+                   msg->id, msg->mode);
+        break;
     }
-    
-    // SDK版本已禁用
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[CMD GO8010] 电机 %s 未找到原生协议控制器", msg->joint_name.c_str());
   }
   
   /**
@@ -886,6 +943,10 @@ private:
   double actual_control_freq_ = 0.0;
   double actual_can_tx_freq_ = 0.0;
   double target_control_freq_ = 200.0;  // 默认值，会被配置文件覆盖
+  
+  // DJI 发送频率统计（成员变量，避免 static 问题）
+  int dji_tx_count_ = 0;
+  rclcpp::Time last_dji_tx_report_time_;
 };
 
 } // namespace motor_control
