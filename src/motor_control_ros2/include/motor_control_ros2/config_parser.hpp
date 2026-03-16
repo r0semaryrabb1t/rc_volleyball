@@ -15,13 +15,15 @@ struct MotorConfig {
   std::string name;           // 电机名称
   std::string type;           // 电机类型 (GM6020, GM3508, DM4340, A1, GO8010)
   int id;                     // 电机 ID
+
   // 可选通用参数
   int direction = 1;          // 方向 (1 或 -1)
-  float offset = 0.0f;        // 零位偏移
+  double offset = 0.0;        // 零位偏移
+
   // GO8010 电机特定参数
   double gear_ratio = 6.33;   // 齿轮减速比
-  double k_pos = 0.0f;         // 位置控制增益
-  double k_spd = 0.0f;         // 速度控制增益
+  double k_pos = 0.0;         // 位置控制增益
+  double k_spd = 0.0;         // 速度控制增益
 };
 
 /**

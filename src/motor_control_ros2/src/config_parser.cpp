@@ -59,7 +59,7 @@ MotorConfig ConfigParser::parseMotorConfig(const YAML::Node& node) {
     config.direction = node["direction"].as<int>();
   }
   if (node["offset"]) {
-    config.offset = node["offset"].as<float>();
+    config.offset = node["offset"].as<double>();
   }
   
   // GO8010 电机特定参数

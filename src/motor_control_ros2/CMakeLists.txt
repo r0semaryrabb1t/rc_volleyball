@@ -45,8 +45,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ChassisCommand.msg"
   "msg/ChassisState.msg"
   "msg/SteerWheelState.msg"
-  "msg/ArmJointCommand.msg"
-  "msg/ArmState.msg"
+  "msg/ArmTarget.msg"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 
@@ -226,18 +225,18 @@ ament_target_dependencies(remote_control_node
   geometry_msgs
 )
 
-# C++ 可执行文件 - 机械臂控制节点
-add_executable(arm_control_node
-  src/arm_control_node.cpp
+# C++ 可执行文件 - Delta 机械臂管理器
+add_executable(delta_arm_manager
+  src/delta_arm_manager_node.cpp
 )
 
 # 链接核心库和消息类型支持
-target_link_libraries(arm_control_node
+target_link_libraries(delta_arm_manager
   motor_control_lib
   "${cpp_typesupport_target}"
 )
 
-ament_target_dependencies(arm_control_node
+ament_target_dependencies(delta_arm_manager
   rclcpp
   std_msgs
   geometry_msgs
@@ -245,7 +244,7 @@ ament_target_dependencies(arm_control_node
 )
 
 # 设置 RPATH
-set_target_properties(arm_control_node PROPERTIES
+set_target_properties(delta_arm_manager PROPERTIES
   INSTALL_RPATH "$ORIGIN"
 )
 
@@ -258,7 +257,7 @@ install(TARGETS
   omni_chassis_control_node
   joystick_control_node
   remote_control_node
-  arm_control_node
+  delta_arm_manager
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
