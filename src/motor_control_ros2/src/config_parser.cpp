@@ -59,18 +59,18 @@ MotorConfig ConfigParser::parseMotorConfig(const YAML::Node& node) {
     config.direction = node["direction"].as<int>();
   }
   if (node["offset"]) {
-    config.offset = node["offset"].as<float>();
+    config.offset = node["offset"].as<double>();
   }
   
   // GO8010 电机特定参数
   if (node["gear_ratio"]) {
-    config.gear_ratio = node["gear_ratio"].as<float>();
+    config.gear_ratio = node["gear_ratio"].as<double>();
   }
   if (node["k_pos"]) {
-    config.k_pos = node["k_pos"].as<float>();
+    config.k_pos = node["k_pos"].as<double>();
   }
   if (node["k_spd"]) {
-    config.k_spd = node["k_spd"].as<float>();
+    config.k_spd = node["k_spd"].as<double>();
   }
   
   return config;
