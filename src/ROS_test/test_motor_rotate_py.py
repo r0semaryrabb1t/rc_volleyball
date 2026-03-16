@@ -165,8 +165,8 @@ def main():
     # 电机参数（与官方SDK相同）
     motor_id = 3
     mode = 1 # FOC模式
-    k_pos = 0.20 # 刚度系数
-    k_spd = 0.04   # 阻尼系数
+    k_pos = 0.00 # 刚度系数
+    k_spd = 0.00   # 阻尼系数
     
     target_speed = 0.0* gear_ratio  # -39.75 rad/s
     

@@ -37,7 +37,7 @@ void UnitreeGO8010Command_fini_function(void * message_memory)
   typed_message->~UnitreeGO8010Command();
 }
 
-static const ::rosidl_typesupport_introspection_cpp::MessageMember UnitreeGO8010Command_message_member_array[8] = {
+static const ::rosidl_typesupport_introspection_cpp::MessageMember UnitreeGO8010Command_message_member_array[9] = {
   {
     "header",  // name
     ::rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE,  // type
@@ -56,14 +56,31 @@ static const ::rosidl_typesupport_introspection_cpp::MessageMember UnitreeGO8010
     nullptr  // resize(index) function pointer
   },
   {
-    "joint_name",  // name
+    "id",  // name
+    ::rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT8,  // type
+    0,  // upper bound of string
+    nullptr,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(motor_control_ros2::msg::UnitreeGO8010Command, id),  // bytes offset in struct
+    nullptr,  // default value
+    nullptr,  // size() function pointer
+    nullptr,  // get_const(index) function pointer
+    nullptr,  // get(index) function pointer
+    nullptr,  // fetch(index, &value) function pointer
+    nullptr,  // assign(index, value) function pointer
+    nullptr  // resize(index) function pointer
+  },
+  {
+    "device",  // name
     ::rosidl_typesupport_introspection_cpp::ROS_TYPE_STRING,  // type
     0,  // upper bound of string
     nullptr,  // members of sub message
     false,  // is array
     0,  // array size
     false,  // is upper bound
-    offsetof(motor_control_ros2::msg::UnitreeGO8010Command, joint_name),  // bytes offset in struct
+    offsetof(motor_control_ros2::msg::UnitreeGO8010Command, device),  // bytes offset in struct
     nullptr,  // default value
     nullptr,  // size() function pointer
     nullptr,  // get_const(index) function pointer
@@ -179,7 +196,7 @@ static const ::rosidl_typesupport_introspection_cpp::MessageMember UnitreeGO8010
 static const ::rosidl_typesupport_introspection_cpp::MessageMembers UnitreeGO8010Command_message_members = {
   "motor_control_ros2::msg",  // message namespace
   "UnitreeGO8010Command",  // message name
-  8,  // number of fields
+  9,  // number of fields
   sizeof(motor_control_ros2::msg::UnitreeGO8010Command),
   UnitreeGO8010Command_message_member_array,  // message members
   UnitreeGO8010Command_init_function,  // function to initialize message memory (memory has to be allocated)

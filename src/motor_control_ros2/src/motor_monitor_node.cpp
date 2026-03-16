@@ -91,10 +91,10 @@ public:
 private:
   struct MotorStats {
     rclcpp::Time last_update;
-    double actual_hz;
-    int msg_count;
+    double actual_hz = 0.0;
+    int msg_count = 0;
     rclcpp::Time last_stat_time;
-    bool was_online;  // 上一次的在线状态
+    bool was_online = false;
   };
   
   void djiCallback(const motor_control_ros2::msg::DJIMotorState::SharedPtr msg) {
@@ -282,47 +282,48 @@ private:
     // 宇树电机状态
     if (!unitree_states_.empty() || !unitree_go_states_.empty()) {
       oss << COLOR_BOLD << COLOR_BLUE << "【宇树电机】" << COLOR_RESET << "\n";
-      oss << COLOR_DIM 
-          << "┌─────────────┬──────────┬────────┬──────────┬──────────┬──────────┬──────┬────────┐\n"
-          << "│ 名称        │ 型号     │ 状态   │ 角度(°)  │ 速度(r/s)│ 力矩(Nm) │ 温度 │ 频率   │\n"
-          << "├─────────────┼──────────┼────────┼──────────┼──────────┼──────────┼──────┼────────┤"
+      oss << COLOR_DIM
+          << "┌─────────────┬──────────┬────┬────────┬──────────┬──────────┬──────────┬──────┬──────┬────────┐\n"
+          << "│ 名称        │ 型号     │ ID │ 状态   │ 位置(rad)│ 速度(r/s)│ 力矩(Nm) │ 温度 │ 错误 │ 频率   │\n"
+          << "├─────────────┼──────────┼────┼────────┼──────────┼──────────┼──────────┼──────┼──────┼────────┤"
           << COLOR_RESET << "\n";
-      
+
       for (const auto& [name, state] : unitree_states_) {
         bool is_online = isMotorOnline(unitree_stats_[name], state.online);
         std::string status_color = is_online ? COLOR_GREEN : COLOR_RED;
         std::string status_text = is_online ? "在线" : "离线";
-        double angle_deg = state.position * 180.0 / M_PI;
-        
+
         oss << "│ " << std::left << std::setw(11) << name << " │ "
             << std::setw(8) << "A1" << " │ "
+            << std::right << std::setw(2) << (int)state.motor_id << " │ "
             << status_color << std::setw(6) << status_text << COLOR_RESET << " │ "
-            << std::right << std::setw(8) << std::fixed << std::setprecision(1) << angle_deg << " │ "
+            << std::right << std::setw(8) << std::fixed << std::setprecision(3) << state.position << " │ "
             << std::setw(8) << std::setprecision(2) << state.velocity << " │ "
             << std::setw(8) << std::setprecision(2) << state.torque << " │ "
             << std::setw(4) << (int)state.temperature << "°C │ "
+            << (state.error ? COLOR_RED : COLOR_DIM) << std::setw(4) << (int)state.error << COLOR_RESET << " │ "
             << std::setw(5) << std::setprecision(0) << unitree_stats_[name].actual_hz << "Hz │\n";
       }
-      
+
       for (const auto& [name, state] : unitree_go_states_) {
         bool is_online = isMotorOnline(unitree_go_stats_[name], state.online);
         std::string status_color = is_online ? COLOR_GREEN : COLOR_RED;
         std::string status_text = is_online ? "在线" : "离线";
-        double angle_deg = state.position * 180.0 / M_PI;
-      
-        
+
         oss << "│ " << std::left << std::setw(11) << name << " │ "
             << std::setw(8) << "GO-8010" << " │ "
+            << std::right << std::setw(2) << (int)state.motor_id << " │ "
             << status_color << std::setw(6) << status_text << COLOR_RESET << " │ "
-            << std::right << std::setw(8) << std::fixed << std::setprecision(1) << angle_deg << " │ "
+            << std::right << std::setw(8) << std::fixed << std::setprecision(3) << state.position << " │ "
             << std::setw(8) << std::setprecision(2) << state.velocity << " │ "
             << std::setw(8) << std::setprecision(2) << state.torque << " │ "
             << std::setw(4) << (int)state.temperature << "°C │ "
+            << (state.error ? COLOR_RED : COLOR_DIM) << std::setw(4) << (int)state.error << COLOR_RESET << " │ "
             << std::setw(5) << std::setprecision(0) << unitree_go_stats_[name].actual_hz << "Hz │\n";
       }
-      
-      oss << COLOR_DIM 
-          << "└─────────────┴──────────┴────────┴──────────┴──────────┴──────────┴──────┴────────┘"
+
+      oss << COLOR_DIM
+          << "└─────────────┴──────────┴────┴────────┴──────────┴──────────┴──────────┴──────┴──────┴────────┘"
           << COLOR_RESET << "\n\n";
     }
     

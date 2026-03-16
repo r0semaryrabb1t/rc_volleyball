@@ -17,7 +17,7 @@
 #include "std_msgs/msg/header.h"
 // Member `header`
 #include "std_msgs/msg/detail/header__rosidl_typesupport_introspection_c.h"
-// Member `joint_name`
+// Member `device`
 #include "rosidl_runtime_c/string_functions.h"
 
 #ifdef __cplusplus
@@ -39,7 +39,7 @@ void motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspec
   motor_control_ros2__msg__UnitreeGO8010Command__fini(message_memory);
 }
 
-static rosidl_typesupport_introspection_c__MessageMember motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspection_c__UnitreeGO8010Command_message_member_array[8] = {
+static rosidl_typesupport_introspection_c__MessageMember motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspection_c__UnitreeGO8010Command_message_member_array[9] = {
   {
     "header",  // name
     rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE,  // type
@@ -58,14 +58,31 @@ static rosidl_typesupport_introspection_c__MessageMember motor_control_ros2__msg
     NULL  // resize(index) function pointer
   },
   {
-    "joint_name",  // name
+    "id",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_UINT8,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(motor_control_ros2__msg__UnitreeGO8010Command, id),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "device",  // name
     rosidl_typesupport_introspection_c__ROS_TYPE_STRING,  // type
     0,  // upper bound of string
     NULL,  // members of sub message
     false,  // is array
     0,  // array size
     false,  // is upper bound
-    offsetof(motor_control_ros2__msg__UnitreeGO8010Command, joint_name),  // bytes offset in struct
+    offsetof(motor_control_ros2__msg__UnitreeGO8010Command, device),  // bytes offset in struct
     NULL,  // default value
     NULL,  // size() function pointer
     NULL,  // get_const(index) function pointer
@@ -181,7 +198,7 @@ static rosidl_typesupport_introspection_c__MessageMember motor_control_ros2__msg
 static const rosidl_typesupport_introspection_c__MessageMembers motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspection_c__UnitreeGO8010Command_message_members = {
   "motor_control_ros2__msg",  // message namespace
   "UnitreeGO8010Command",  // message name
-  8,  // number of fields
+  9,  // number of fields
   sizeof(motor_control_ros2__msg__UnitreeGO8010Command),
   motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspection_c__UnitreeGO8010Command_message_member_array,  // message members
   motor_control_ros2__msg__UnitreeGO8010Command__rosidl_typesupport_introspection_c__UnitreeGO8010Command_init_function,  // function to initialize message memory (memory has to be allocated)

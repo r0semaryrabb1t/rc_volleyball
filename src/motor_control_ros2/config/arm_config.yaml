@@ -1,0 +1,44 @@
+# Delta 机械臂管理器配置文件
+# 节点：delta_arm_manager
+# 控制对象：3 路 GO8010 电机
+
+# 控制频率（Hz，默认 200Hz）
+control_frequency: 200.0
+
+# 初始化参数（软着陆阶段）
+initialization:
+  # 软着陆施加的向下力矩（Nm，负值表示向下）
+  downward_torque: -1.0
+  # 软着陆超时时间（秒）
+  landing_timeout: 5.0
+  # 着陆判定：三电机绝对角度均小于此阈值（rad）视为到底
+  landing_angle_threshold: 0.02
+  # 着陆稳定判定：连续保持上述条件的时间（秒）
+  landing_stable_duration: 0.5
+
+# PD 控制参数（EXECUTE 阶段位置控制）
+pd:
+  kp: 0.50
+  kd: 0.10
+
+# 运动规划参数（梯形速度规划）
+motion_profile:
+  # 每帧最大速度增量（rad/s，控制 pos_next = pos_now + clamp(err, ±max_velocity*dt)）
+  max_velocity: 2.0
+
+# 安全参数
+safety:
+  # 最大允许高度（米，仅参考，实际以角度控制）
+  max_height: 0.3
+
+# 目标到达容差（rad）：电机角度与目标的差小于此值视为到达
+position_tolerance: 0.05
+
+# 电机名称与 ID（对应 motors.yaml 中的 joint_name）
+motors:
+  - name: "arm_motor_1"
+    id: 0
+  - name: "arm_motor_2"
+    id: 1
+  - name: "arm_motor_3"
+    id: 2

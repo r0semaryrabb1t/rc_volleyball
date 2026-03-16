@@ -1,7 +1,7 @@
 #include "motor_control_ros2/unitree_motor_native.hpp"
+#include <algorithm>
 #include <cstring>
 #include <chrono>
-#include <iostream>
 
 namespace motor_control {
 
@@ -49,269 +49,147 @@ uint16_t calcCrcCcitt(const uint8_t* data, size_t len) {
   return crc;
 }
 
-UnitreeMotorNative::UnitreeMotorNative(const std::string& name, 
+UnitreeMotorNative::UnitreeMotorNative(const std::string& name,
                                        uint8_t motor_id,
-                                       int direction,
-                                       double offset,
-                                       double gear_ratio,
-                                       double k_pos,
-                                       double k_spd)
-  : MotorBase(name, MotorType::UNITREE_GO8010, motor_id, 0)
+                                       double gear_ratio)
+  : MotorBase(name, MotorType::UNITREE_GO8010, static_cast<float>(gear_ratio), true)
   , motor_id_(motor_id)
-  , direction_(direction)
-  , offset_(offset)
   , gear_ratio_(gear_ratio)
-  , default_k_pos_(k_pos)
-  , default_k_spd_(k_spd)
-  , cmd_kp_(k_pos)
-  , cmd_kd_(k_spd)
 {
   memset(tx_buffer_, 0, sizeof(tx_buffer_));
-  memset(rx_buffer_, 0, sizeof(rx_buffer_));
 }
 
-double UnitreeMotorNative::getOutputPosition() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return fb_position_ * direction_ - offset_;
-}
-
-double UnitreeMotorNative::getOutputVelocity() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return fb_velocity_ * direction_;
-}
-
-double UnitreeMotorNative::getOutputTorque() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return fb_torque_ * direction_;
-}
-
-double UnitreeMotorNative::getTemperature() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return static_cast<double>(fb_temperature_);
-}
-
-bool UnitreeMotorNative::isOnline() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return online_;
-}
-
-void UnitreeMotorNative::checkHeartbeat(double timeout_ms, int64_t current_time_ns) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  double dt_ms = (current_time_ns - last_feedback_time_ns_) / 1e6;
-  if (dt_ms > timeout_ms) {
-    online_ = false;
-  }
-}
-
-void UnitreeMotorNative::setSerialInterface(std::shared_ptr<hardware::SerialInterface> serial) {
-  serial_ = serial;
-}
+// =============================================================================
+// 协议层：命令构建
+// =============================================================================
 
 void UnitreeMotorNative::buildCommandPacket() {
-  // Header
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // 直接使用命令值（offset/direction 由上层节点处理）
+  double pos_cmd = cmd_pos_des_;
+  double vel_cmd = cmd_vel_des_;
+  double tau_cmd = cmd_torque_ff_;
+
+  // 协议头
   tx_buffer_[0] = 0xFE;
   tx_buffer_[1] = 0xEE;
-  
-  // Mode byte: id(4bit) | status(3bit) | none(1bit)
-  // 与Python完全一致: cmd[2] = ((motor_id & 0x0F) | ((mode & 0x07) << 4))
-  tx_buffer_[2] = (motor_id_ & 0x0F) | ((static_cast<uint8_t>(mode_) & 0x07) << 4);
-  
-  // 应用方向和偏移
-  double tau_cmd = cmd_torque_ff_ * direction_;
-  double spd_cmd = cmd_vel_des_ * direction_;
-  double pos_cmd = (cmd_pos_des_ + offset_) * direction_;
-  
-  // ========== 与Python完全一致的定点数转换 ==========
-  // Python: tor_des_q8 = int(max(-32768, min(32767, tau * 256)))
-  int16_t tor_des_q8 = static_cast<int16_t>(
-    std::max(-32768.0, std::min(32767.0, tau_cmd * 256.0)));
-  
-  // Python: spd_des_q7 = int(max(-32768, min(32767, spd_des * 256 / 2 / math.pi)))
-  // 注意: Python的spd_des输入已经是电机侧弧度/秒，这里需要先转换
-  double spd_motor = spd_cmd * gear_ratio_;  // 输出侧 -> 电机侧
-  int16_t spd_des_q7 = static_cast<int16_t>(
-    std::max(-32768.0, std::min(32767.0, spd_motor * 256.0 / 2.0 / M_PI)));
-  
-  // Python: pos_des_q15 = int(max(-2147483648, min(2147483647, pos_des * 32768 / 2 / math.pi)))
-  // 注意: Python的pos_des输入已经是电机侧弧度，这里需要先转换
-  double pos_motor = pos_cmd * gear_ratio_;  // 输出侧 -> 电机侧
-  int32_t pos_des_q15 = static_cast<int32_t>(
-    std::max(-2147483648.0, std::min(2147483647.0, pos_motor * 32768.0 / 2.0 / M_PI)));
-  
-  // Python: k_pos_q15 = int(max(0, min(65535, k_pos * 1280))) & 0xFFFF
-  uint16_t k_pos_q15 = static_cast<uint16_t>(
-    std::max(0.0, std::min(65535.0, cmd_kp_ * 1280.0)));
-  
-  // Python: k_spd_q15 = int(max(0, min(65535, k_spd * 1280))) & 0xFFFF
-  uint16_t k_spd_q15 = static_cast<uint16_t>(
-    std::max(0.0, std::min(65535.0, cmd_kd_ * 1280.0)));
-  
-  // 打包成小端序（与Python struct.pack('<h', ...) 一致） (与 Python struct.pack('<h', ...) 一致)
-  memcpy(&tx_buffer_[3], &tor_des_q8, 2);
-  memcpy(&tx_buffer_[5], &spd_des_q7, 2);
-  memcpy(&tx_buffer_[7], &pos_des_q15, 4);
-  memcpy(&tx_buffer_[11], &k_pos_q15, 2);
-  memcpy(&tx_buffer_[13], &k_spd_q15, 2);
-  
-  // CRC (前15字节)
+
+  // mode 字节: id(4bit) | status(3bit) | none(1bit)
+  tx_buffer_[2] = static_cast<uint8_t>((motor_id_ & 0x0F) |
+                                       ((static_cast<uint8_t>(mode_) & 0x07) << 4));
+
+  // 定点数转换
+  auto clamp_i16 = [](double v) -> int16_t {
+    if (v > 32767.0) return 32767;
+    if (v < -32768.0) return -32768;
+    return static_cast<int16_t>(v);
+  };
+  auto clamp_i32 = [](double v) -> int32_t {
+    if (v > 2147483647.0) return 2147483647;
+    if (v < -2147483648.0) return static_cast<int32_t>(-2147483647 - 1);
+    return static_cast<int32_t>(v);
+  };
+  auto clamp_u16 = [](double v) -> uint16_t {
+    if (v < 0.0) return 0;
+    if (v > 65535.0) return 65535;
+    return static_cast<uint16_t>(v);
+  };
+
+  int16_t tor_des_q8 = clamp_i16(tau_cmd * 256.0);
+  int16_t spd_des_q7 = clamp_i16(vel_cmd * gear_ratio_ * 256.0 / (2.0 * M_PI));
+  int32_t pos_des_q15 = clamp_i32(pos_cmd * gear_ratio_ * 32768.0 / (2.0 * M_PI));
+  uint16_t k_pos_q15 = clamp_u16(cmd_kp_ * 1280.0);
+  uint16_t k_spd_q15 = clamp_u16(cmd_kd_ * 1280.0);
+
+  // 小端序打包到 [3..14]
+  std::memcpy(&tx_buffer_[3], &tor_des_q8, sizeof(tor_des_q8));
+  std::memcpy(&tx_buffer_[5], &spd_des_q7, sizeof(spd_des_q7));
+  std::memcpy(&tx_buffer_[7], &pos_des_q15, sizeof(pos_des_q15));
+  std::memcpy(&tx_buffer_[11], &k_pos_q15, sizeof(k_pos_q15));
+  std::memcpy(&tx_buffer_[13], &k_spd_q15, sizeof(k_spd_q15));
+
+  // CRC16（前 15 字节）
   uint16_t crc = calcCrcCcitt(tx_buffer_, 15);
-  tx_buffer_[15] = crc & 0xFF;
-  tx_buffer_[16] = (crc >> 8) & 0xFF;
+  tx_buffer_[15] = static_cast<uint8_t>(crc & 0xFF);
+  tx_buffer_[16] = static_cast<uint8_t>((crc >> 8) & 0xFF);
 }
 
-bool UnitreeMotorNative::parseFeedbackPacket(const uint8_t* data, size_t len) {
+size_t UnitreeMotorNative::getCommandPacket(uint8_t* buffer) {
+  buildCommandPacket();
+  std::memcpy(buffer, tx_buffer_, 17);
+  return 17;
+}
+
+// =============================================================================
+// 协议层：反馈解析
+// =============================================================================
+
+bool UnitreeMotorNative::parseFeedback(const uint8_t* data, size_t len) {
   if (len < 16) {
     return false;
   }
-  
+
   // 检查头部：返回帧头是 0xFD 0xEE（发送帧头是 0xFE 0xEE）
   if (data[0] != 0xFD || data[1] != 0xEE) {
     return false;
   }
-  
+
   // 检查电机ID
   uint8_t fb_id = data[2] & 0x0F;
   if (fb_id != motor_id_) {
     return false;
   }
-  
+
   // 验证CRC
   uint16_t recv_crc = data[14] | (data[15] << 8);
   uint16_t calc_crc = calcCrcCcitt(data, 14);
   if (recv_crc != calc_crc) {
     return false;
   }
-  
+
   // 解析定点数
   int16_t torque_q8;
   int16_t speed_q7;
   int32_t pos_q15;
   int8_t temp;
-  
+
   memcpy(&torque_q8, &data[3], 2);
   memcpy(&speed_q7, &data[5], 2);
   memcpy(&pos_q15, &data[7], 4);
   memcpy(&temp, &data[11], 1);
-  
+
   uint8_t merror = data[12] & 0x07;
-  
+
   // ========== 与 Python 完全一致的转换 ==========
-  // Python: torque = torque_q8 / 256.0
   double torque = torque_q8 / 256.0;
-  
-  // Python: speed = speed_q7 * 2 * math.pi / gear_ratio / 256.0
   double speed = speed_q7 * 2.0 * M_PI / gear_ratio_ / 256.0;
-  
-  // Python: pos = pos_q15 * 360 / gear_ratio / 32768.0  (输出是度)
   double pos_deg = pos_q15 * 360.0 / gear_ratio_ / 32768.0;
-  // 转换为弧度
   double pos_rad = pos_deg * M_PI / 180.0;
-  
-  // 更新状态
+
+  // 更新基类状态（应用方向和偏移，使 MotorBase::getOutputPosition() 等直接可用）
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    fb_torque_ = torque;
-    fb_velocity_ = speed;
-    fb_position_ = pos_rad;
-    fb_temperature_ = temp;
     error_code_ = merror;
-    online_ = true;
-    last_feedback_time_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
   }
-  
+
+  // 更新基类字段（原始值，offset/direction 由上层节点处理）
+  position_ = pos_rad;
+  velocity_ = speed;
+  torque_ = torque;
+  temperature_ = static_cast<float>(temp);
+
+  // 更新基类心跳（设置 online_ = true 并记录时间）
+  updateLastFeedbackTime(std::chrono::steady_clock::now().time_since_epoch().count());
+
   return true;
 }
 
-bool UnitreeMotorNative::sendRecv() {
-  if (!serial_) {
-    return false;
-  }
-  
-  // 构建命令包
-  buildCommandPacket();
-  
-  // 调试计数器
-  static int send_debug_count = 0;
-  send_debug_count++;
-  bool debug_print = (send_debug_count % 100 == 1);
-  
-  if (debug_print) {
-    std::cout << "[UnitreeNative TX] ID=" << (int)motor_id_ << " Mode=" << (int)mode_
-              << " Data: ";
-    for (int i = 0; i < 17; ++i) {
-      printf("%02X ", tx_buffer_[i]);
-    }
-    std::cout << std::endl;
-  }
-  
-  // ========== 与 Python 完全一致的发送接收流程 ==========
-  
-  // Python: ser.write(cmd)
-  ssize_t sent = serial_->send(tx_buffer_, 17);
-  if (sent != 17) {
-    if (debug_print) {
-      std::cerr << "[UnitreeNative] 发送失败: sent=" << sent << std::endl;
-    }
-    return false;
-  }
-  
-  // Python: time.sleep(0.01) - 等待10ms让电机响应
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  
-  // Python: response = b''
-  //         while len(response) < 16:
-  //             chunk = ser.read(16 - len(response))
-  //             if not chunk: break
-  //             response += chunk
-  uint8_t response[32];
-  size_t total_received = 0;
-  int timeout_count = 0;
-  const int max_timeout = 20;  // 最多等待 20ms
-  
-  while (total_received < 16 && timeout_count < max_timeout) {
-    ssize_t n = serial_->receive(response + total_received, 16 - total_received);
-    if (n > 0) {
-      total_received += n;
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      timeout_count++;
-    }
-  }
-  
-  if (debug_print) {
-    std::cout << "[UnitreeNative RX] 原始数据 (" << total_received << " 字节): ";
-    for (size_t i = 0; i < total_received; ++i) {
-      printf("%02X ", response[i]);
-    }
-    std::cout << std::endl;
-  }
-  
-  // Python: if len(response) >= 16:
-  //             feedback = parse_motor_feedback(response)
-  if (total_received >= 16) {
-    // 直接解析（Python 没有搜索帧头，直接解析前16字节）
-    memcpy(rx_buffer_, response, 16);
-    
-    if (parseFeedbackPacket(rx_buffer_, 16)) {
-      if (debug_print) {
-        std::cout << "[UnitreeNative] 解析成功" << std::endl;
-      }
-      return true;
-    } else {
-      if (debug_print) {
-        std::cout << "[UnitreeNative] 解析失败" << std::endl;
-      }
-    }
-  } else {
-    if (debug_print) {
-      std::cout << "[UnitreeNative] 数据不足: " << total_received << " < 16" << std::endl;
-    }
-  }
-  
-  return false;
-}
+// =============================================================================
+// 控制命令
+// =============================================================================
 
-void UnitreeMotorNative::setFOCCommand(double pos_des, double vel_des, 
+void UnitreeMotorNative::setFOCCommand(double pos_des, double vel_des,
                                        double kp, double kd, double torque_ff) {
   std::lock_guard<std::mutex> lock(mutex_);
   mode_ = Mode::FOC;
@@ -335,25 +213,6 @@ void UnitreeMotorNative::setBrakeCommand() {
 void UnitreeMotorNative::setCalibrateCommand() {
   std::lock_guard<std::mutex> lock(mutex_);
   mode_ = Mode::CALIBRATE;
-}
-
-void UnitreeMotorNative::setVelocityCommand(double vel_des) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  mode_ = Mode::FOC;
-  cmd_vel_des_ = vel_des;
-  cmd_kp_ = 0.0;  // 纯速度控制时刚度为0
-  cmd_kd_ = default_k_spd_;
-  cmd_torque_ff_ = 0.0;
-}
-
-void UnitreeMotorNative::setPositionCommand(double pos_des) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  mode_ = Mode::FOC;
-  cmd_pos_des_ = pos_des;
-  cmd_vel_des_ = 0.0;
-  cmd_kp_ = default_k_pos_;
-  cmd_kd_ = default_k_spd_;
-  cmd_torque_ff_ = 0.0;
 }
 
 } // namespace motor_control

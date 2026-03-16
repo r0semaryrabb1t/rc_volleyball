@@ -14,7 +14,7 @@
 // Include directives for member types
 // Member `header`
 #include "std_msgs/msg/detail/header__functions.h"
-// Member `joint_name`
+// Member `device`
 #include "rosidl_runtime_c/string_functions.h"
 
 bool
@@ -28,8 +28,9 @@ motor_control_ros2__msg__UnitreeGO8010Command__init(motor_control_ros2__msg__Uni
     motor_control_ros2__msg__UnitreeGO8010Command__fini(msg);
     return false;
   }
-  // joint_name
-  if (!rosidl_runtime_c__String__init(&msg->joint_name)) {
+  // id
+  // device
+  if (!rosidl_runtime_c__String__init(&msg->device)) {
     motor_control_ros2__msg__UnitreeGO8010Command__fini(msg);
     return false;
   }
@@ -50,8 +51,9 @@ motor_control_ros2__msg__UnitreeGO8010Command__fini(motor_control_ros2__msg__Uni
   }
   // header
   std_msgs__msg__Header__fini(&msg->header);
-  // joint_name
-  rosidl_runtime_c__String__fini(&msg->joint_name);
+  // id
+  // device
+  rosidl_runtime_c__String__fini(&msg->device);
   // mode
   // position_target
   // velocity_target
@@ -72,9 +74,13 @@ motor_control_ros2__msg__UnitreeGO8010Command__are_equal(const motor_control_ros
   {
     return false;
   }
-  // joint_name
+  // id
+  if (lhs->id != rhs->id) {
+    return false;
+  }
+  // device
   if (!rosidl_runtime_c__String__are_equal(
-      &(lhs->joint_name), &(rhs->joint_name)))
+      &(lhs->device), &(rhs->device)))
   {
     return false;
   }
@@ -119,9 +125,11 @@ motor_control_ros2__msg__UnitreeGO8010Command__copy(
   {
     return false;
   }
-  // joint_name
+  // id
+  output->id = input->id;
+  // device
   if (!rosidl_runtime_c__String__copy(
-      &(input->joint_name), &(output->joint_name)))
+      &(input->device), &(output->device)))
   {
     return false;
   }
