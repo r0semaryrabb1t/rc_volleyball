@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -222,13 +223,48 @@ private:
     motor->setInterfaceName(interface_name);
     motor->setDevicePath(device_path);
 
+    // 保存方向/零位偏移配置（用于状态发布与命令变换）
+    int direction = (config.direction >= 0) ? 1 : -1;
+    unitree_direction_[config.name] = direction;
+    unitree_offset_[config.name] = config.offset;
+
     motors_[config.name] = motor;
     unitree_native_motors_.push_back(motor);
 
     RCLCPP_INFO(this->get_logger(),
-                "添加宇树电机(原生): %s (ID=%d, 齿轮比=%.2f) -> %s",
+                "添加宇树电机(原生): %s (ID=%d, 方向=%d, offset=%.4f rad, 齿轮比=%.2f) -> %s",
                 config.name.c_str(), config.id,
-                config.gear_ratio, interface_name.c_str());
+                direction, config.offset, config.gear_ratio, interface_name.c_str());
+  }
+
+  int getUnitreeDirection(const std::string& joint_name) const {
+    auto it = unitree_direction_.find(joint_name);
+    return (it != unitree_direction_.end()) ? it->second : 1;
+  }
+
+  double getUnitreeOffset(const std::string& joint_name) const {
+    auto it = unitree_offset_.find(joint_name);
+    return (it != unitree_offset_.end()) ? it->second : 0.0;
+  }
+
+  double applyUnitreePosition(const std::string& joint_name, double raw_position) const {
+    // 统一语义：输出位置 = 原始位置 * direction - offset
+    return raw_position * static_cast<double>(getUnitreeDirection(joint_name)) - getUnitreeOffset(joint_name);
+  }
+
+  double applyUnitreeVelocity(const std::string& joint_name, double raw_velocity) const {
+    return raw_velocity * static_cast<double>(getUnitreeDirection(joint_name));
+  }
+
+  double applyUnitreeTorque(const std::string& joint_name, double raw_torque) const {
+    return raw_torque * static_cast<double>(getUnitreeDirection(joint_name));
+  }
+
+  double outputToRawUnitreePosition(const std::string& joint_name, double output_position) const {
+    // 与 applyUnitreePosition 互逆：raw = (output + offset) / direction
+    int dir = getUnitreeDirection(joint_name);
+    double offset = getUnitreeOffset(joint_name);
+    return (output_position + offset) / static_cast<double>(dir);
   }
 
   /**
@@ -506,12 +542,17 @@ private:
         }
 
         if (ok) {
+          const std::string joint = motor->getJointName();
+          const double pos = applyUnitreePosition(joint, motor->getOutputPosition());
+          const double vel = applyUnitreeVelocity(joint, motor->getOutputVelocity());
+          const double tor = applyUnitreeTorque(joint, motor->getOutputTorque());
+
           RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
               "[Serial Thread] %s: Pos=%.3f° Vel=%.3f rad/s Tor=%.3f Nm Tmp=%d°C Online=%d",
               motor->getJointName().c_str(),
-              motor->getOutputPosition() * 180.0 / M_PI,
-              motor->getOutputVelocity(),
-              motor->getOutputTorque(),
+              pos * 180.0 / M_PI,
+              vel,
+              tor,
               (int)motor->getTemperature(),
               motor->isOnline() ? 1 : 0);
         }
@@ -703,13 +744,14 @@ private:
     // 发布原生协议宇树电机状态
     for (auto& motor : unitree_native_motors_) {
       auto msg = motor_control_ros2::msg::UnitreeGO8010State();
+      const std::string joint = motor->getJointName();
       msg.header.stamp = now;
-      msg.joint_name = motor->getJointName();
+      msg.joint_name = joint;
       msg.motor_id = motor->getMotorId();
       msg.online = motor->isOnline();
-      msg.position = motor->getOutputPosition();
-      msg.velocity = motor->getOutputVelocity();
-      msg.torque = motor->getOutputTorque();
+      msg.position = applyUnitreePosition(joint, motor->getOutputPosition());
+      msg.velocity = applyUnitreeVelocity(joint, motor->getOutputVelocity());
+      msg.torque = applyUnitreeTorque(joint, motor->getOutputTorque());
       msg.temperature = static_cast<int8_t>(motor->getTemperature());
       msg.error = motor->getErrorCode();
       unitree_go_state_pub_->publish(msg);
@@ -798,8 +840,14 @@ private:
 
       case 1:  // MODE_FOC
         for (auto& native_motor : matched_motors) {
-          native_motor->setFOCCommand(msg->position_target, msg->velocity_target,
-                              msg->kp, msg->kd, msg->torque_ff);
+          const std::string& joint = native_motor->getJointName();
+          const int dir = getUnitreeDirection(joint);
+
+          const double raw_pos = outputToRawUnitreePosition(joint, msg->position_target);
+          const double raw_vel = msg->velocity_target / static_cast<double>(dir);
+          const double raw_tau = msg->torque_ff / static_cast<double>(dir);
+
+          native_motor->setFOCCommand(raw_pos, raw_vel, msg->kp, msg->kd, raw_tau);
         }
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "[CMD GO8010 Native] ID=%d FOC: pos=%.2f°, vel=%.2f rad/s, kp=%.2f, kd=%.2f, tau=%.3f",
@@ -1045,6 +1093,10 @@ private:
   // 串口通信线程（每个串口接口一个线程，并行收发）
   std::vector<std::thread> serial_comm_threads_;
   std::atomic<bool> serial_running_{false};
+
+  // 宇树电机坐标映射（从 motors.yaml 读取）
+  std::unordered_map<std::string, int> unitree_direction_;
+  std::unordered_map<std::string, double> unitree_offset_;
 };
 
 // 补齐 namespace 闭合
