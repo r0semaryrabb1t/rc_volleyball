@@ -78,7 +78,6 @@ target_link_libraries(motor_control_lib
   "${cpp_typesupport_target}" 
   yaml-cpp
   # ${UNITREE_SDK_LIB}  # SDK可选
-  serial
 )
 
 # SDK包含路径（可选）
