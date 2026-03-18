@@ -396,6 +396,22 @@ ros2 run motor_control_ros2 motor_control_node
 6. **电机名称**: 确保配置文件中的电机名称唯一
 7. **CAN ID**: 同一总线上的电机 ID 不能重复
 
+## 🔁 Pull Request 标准工作流
+
+为降低多人协作时的架构漂移风险，仓库已提供以下 PR 自动检查：
+
+- `PR CI`：自动执行 ROS2 依赖安装、`colcon build`、`colcon test`
+- `PR Title Check`：强制 PR 标题使用规范前缀（`feat/fix/docs/refactor/test/chore/ci`）
+- `CodeQL`：自动执行 C++/Python 安全扫描
+- `CODEOWNERS`：核心目录改动默认请求代码所有者评审
+- `pull_request_template.md`：统一 PR 描述与自检清单
+
+建议在仓库 Settings → Branches 中开启分支保护：
+
+1. Require a pull request before merging
+2. Require approvals（至少 1 位 reviewer）
+3. Require status checks to pass before merging（勾选 `PR CI`、`PR Title Check`、`CodeQL`）
+
 ## 📖 相关文档
 
 - `.agent/yaml_config_guide.md` - YAML 配置详细指南

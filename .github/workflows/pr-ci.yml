@@ -1,0 +1,43 @@
+name: PR CI
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup ROS 2 Humble
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-colcon-common-extensions python3-rosdep
+
+      - name: Init rosdep
+        run: |
+          sudo rosdep init || true
+          rosdep update
+
+      - name: Install dependencies
+        run: rosdep install --from-paths src --ignore-src -r -y
+
+      - name: Build
+        run: colcon build --event-handlers console_cohesion+ --packages-select motor_control_ros2
+
+      - name: Test
+        run: |
+          colcon test --event-handlers console_cohesion+ --packages-select motor_control_ros2
+          colcon test-result --verbose

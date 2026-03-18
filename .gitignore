@@ -5,3 +5,7 @@
 /fdilink_ahrs_ROS1
 
 /__pycache__
+*.pyc
+
+.vscode/
+.idea/
