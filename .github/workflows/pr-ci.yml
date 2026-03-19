@@ -145,6 +145,8 @@ jobs:
             const sourceLabel = pull.head.repo.full_name === `${owner}/${repo}` ? '同仓库 PR' : 'fork PR'
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
             const formatError = (error) => String(error?.message || error).replace(/\s+/g, ' ').trim()
+            const isApprovalPermissionError = (error) =>
+              /GitHub Actions is not permitted to approve pull requests\./i.test(formatError(error))
 
             const renderResult = (result) => {
               switch (result) {
@@ -278,9 +280,13 @@ jobs:
                   automationLines.push('- 自动审批：已完成')
                 }
               } catch (error) {
-                const message = `自动审批失败：${formatError(error)}`
-                automationLines.push(`- 自动审批：失败（${formatError(error)}）`)
-                automationError = automationError || message
+                if (isApprovalPermissionError(error)) {
+                  automationLines.push('- 自动审批：跳过（仓库未允许 GitHub Actions approve PR）')
+                } else {
+                  const message = `自动审批失败：${formatError(error)}`
+                  automationLines.push(`- 自动审批：失败（${formatError(error)}）`)
+                  automationError = automationError || message
+                }
               }
 
               try {
