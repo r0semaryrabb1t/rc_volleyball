@@ -2,15 +2,51 @@ name: PR CI
 
 on:
   pull_request:
-    branches:
-      - "**"
-  push:
-    branches:
-      - main
-      - master
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+
+permissions: {}
+
+concurrency:
+  group: pr-ci-${{ github.event.pull_request.number }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
+  semantic-title:
+    if: github.event_name == 'pull_request'
+    name: Semantic PR title
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            test
+            chore
+            ci
+
   build-and-test:
+    if: github.event_name == 'pull_request'
+    name: ROS build and test
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -19,8 +55,10 @@ jobs:
       COLCON_PACKAGES_ARG: --packages-up-to motor_control_ros2
       ROS_DISTRO: humble
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup ROS 2 Humble
         uses: ros-tooling/setup-ros@v0.7
@@ -56,4 +94,286 @@ jobs:
         run: |
           source /opt/ros/${ROS_DISTRO}/setup.bash
           colcon test --event-handlers console_cohesion+ ${COLCON_PACKAGES_ARG}
+
+      - name: Show test results
+        if: always()
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
           colcon test-result --verbose
+
+  pr-gate:
+    name: PR gate
+    runs-on: ubuntu-latest
+    needs:
+      - semantic-title
+      - build-and-test
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Enforce required PR checks
+        env:
+          TITLE_RESULT: ${{ needs.semantic-title.result }}
+          BUILD_RESULT: ${{ needs.build-and-test.result }}
+        run: |
+          echo "Semantic PR title: ${TITLE_RESULT}"
+          echo "ROS build and test: ${BUILD_RESULT}"
+
+          test "${TITLE_RESULT}" = "success" && test "${BUILD_RESULT}" = "success"
+
+  report-and-merge:
+    if: github.event_name == 'pull_request_target'
+    name: PR automation
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Wait for checks, update summary, and enable merge automation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- pr-automation-summary -->'
+            const workflowId = 'pr-ci.yml'
+            const gateJobName = 'PR gate'
+            const detailJobNames = ['Semantic PR title', 'ROS build and test']
+            const observedJobs = [...detailJobNames, gateJobName]
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const pull = context.payload.pull_request
+            const pullNumber = pull.number
+            const sourceLabel = pull.head.repo.full_name === `${owner}/${repo}` ? '同仓库 PR' : 'fork PR'
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+            const formatError = (error) => String(error?.message || error).replace(/\s+/g, ' ').trim()
+
+            const renderResult = (result) => {
+              switch (result) {
+                case 'success':
+                  return '✅ 通过'
+                case 'failure':
+                  return '❌ 失败'
+                case 'cancelled':
+                  return '⚪ 已取消'
+                case 'skipped':
+                  return '⚪ 已跳过'
+                case 'neutral':
+                  return '⚪ 中性'
+                case 'timed_out':
+                  return '❌ 超时'
+                case 'action_required':
+                  return '⚠️ 需要处理'
+                default:
+                  return `⚠️ ${result}`
+              }
+            }
+
+            async function waitForObservedJobs() {
+              const deadline = Date.now() + 20 * 60 * 1000
+
+              while (Date.now() < deadline) {
+                const runsResponse = await github.rest.actions.listWorkflowRuns({
+                  owner,
+                  repo,
+                  workflow_id: workflowId,
+                  event: 'pull_request',
+                  head_sha: pull.head.sha,
+                  per_page: 20,
+                })
+
+                const run = runsResponse.data.workflow_runs
+                  .filter(
+                    (candidate) =>
+                      candidate.head_repository?.full_name === pull.head.repo.full_name &&
+                      candidate.head_branch === pull.head.ref,
+                  )
+                  .sort((left, right) => new Date(right.created_at) - new Date(left.created_at))[0]
+
+                if (!run) {
+                  core.info('Waiting for pull_request workflow run to start.')
+                  await sleep(15000)
+                  continue
+                }
+
+                if (run.status !== 'completed') {
+                  core.info(`Waiting for workflow run ${run.id} to complete (status: ${run.status}).`)
+                  await sleep(15000)
+                  continue
+                }
+
+                const jobsResponse = await github.rest.actions.listJobsForWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                  per_page: 100,
+                })
+
+                const jobsByName = new Map(
+                  jobsResponse.data.jobs
+                    .filter((job) => observedJobs.includes(job.name))
+                    .map((job) => [job.name, job]),
+                )
+
+                const missingJobs = observedJobs.filter((name) => !jobsByName.has(name))
+                if (missingJobs.length > 0) {
+                  core.info(`Workflow run ${run.id} is missing jobs: ${missingJobs.join(', ')}.`)
+                  await sleep(15000)
+                  continue
+                }
+
+                const incompleteJobs = observedJobs.filter((name) => jobsByName.get(name).status !== 'completed')
+                if (incompleteJobs.length > 0) {
+                  core.info(`Waiting for jobs to complete: ${incompleteJobs.join(', ')}.`)
+                  await sleep(15000)
+                  continue
+                }
+
+                return {
+                  run,
+                  results: observedJobs.map((name) => ({
+                    name,
+                    result: jobsByName.get(name).conclusion || jobsByName.get(name).status,
+                  })),
+                }
+              }
+
+              throw new Error(`Timed out waiting for observed pull_request jobs on PR #${pullNumber}.`)
+            }
+
+            const { run, results } = await waitForObservedJobs()
+            const detailResults = results.filter((job) => detailJobNames.includes(job.name))
+            const gateResult = results.find((job) => job.name === gateJobName)?.result
+            const allPassed = gateResult === 'success'
+            const failedJobs = detailResults.filter((job) => job.result !== 'success').map((job) => job.name)
+            const automationLines = [`- PR 来源：${sourceLabel}`, `- 汇总门禁（PR gate）：${renderResult(gateResult)}`]
+            let automationError = null
+
+            if (pull.draft) {
+              automationLines.push('- 自动审批 / 自动合并：跳过（Draft PR）')
+            } else if (!allPassed) {
+              automationLines.push('- 自动审批 / 自动合并：跳过（存在未通过检查）')
+            } else {
+              try {
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                  owner,
+                  repo,
+                  pull_number: pullNumber,
+                  per_page: 100,
+                })
+
+                const latestBotApproval = reviews
+                  .filter((review) => review.user?.login === 'github-actions[bot]')
+                  .sort((left, right) => new Date(left.submitted_at || 0) - new Date(right.submitted_at || 0))
+                  .at(-1)
+
+                if (latestBotApproval?.state === 'APPROVED') {
+                  automationLines.push('- 自动审批：已存在 bot approval')
+                } else {
+                  await github.rest.pulls.createReview({
+                    owner,
+                    repo,
+                    pull_number: pullNumber,
+                    event: 'APPROVE',
+                    body: 'All required PR checks passed. Enabling squash auto-merge.',
+                  })
+                  automationLines.push('- 自动审批：已完成')
+                }
+              } catch (error) {
+                const message = `自动审批失败：${formatError(error)}`
+                automationLines.push(`- 自动审批：失败（${formatError(error)}）`)
+                automationError = automationError || message
+              }
+
+              try {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        id
+                        autoMergeRequest {
+                          enabledAt
+                        }
+                      }
+                    }
+                  }`,
+                  {
+                    owner,
+                    repo,
+                    number: pullNumber,
+                  },
+                )
+
+                const pullRequest = data.repository.pullRequest
+                if (pullRequest.autoMergeRequest) {
+                  automationLines.push('- Squash auto-merge：已启用')
+                } else {
+                  await github.graphql(
+                    `mutation($pullRequestId: ID!) {
+                      enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: SQUASH }) {
+                        pullRequest {
+                          number
+                        }
+                      }
+                    }`,
+                    {
+                      pullRequestId: pullRequest.id,
+                    },
+                  )
+                  automationLines.push('- Squash auto-merge：已启用')
+                }
+              } catch (error) {
+                const message = `启用 squash auto-merge 失败：${formatError(error)}`
+                automationLines.push(`- Squash auto-merge：失败（${formatError(error)}）`)
+                automationError = automationError || message
+              }
+            }
+
+            const bodyLines = [
+              marker,
+              '## PR 自动化结果',
+              '',
+              ...detailResults.map((job) => `- ${job.name}：${renderResult(job.result)}`),
+              `- ${gateJobName}：${renderResult(gateResult)}`,
+            ]
+
+            if (failedJobs.length > 0) {
+              bodyLines.push('', `失败 job：${failedJobs.join('、')}`)
+            }
+
+            bodyLines.push(
+              '',
+              `关联 workflow run：${run.html_url}`,
+              '',
+              '### 自动化处理',
+              ...automationLines,
+              '',
+              `更新于：${new Date().toISOString()}`,
+            )
+
+            const body = bodyLines.join('\n')
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pullNumber,
+              per_page: 100,
+            })
+            const existing = [...comments].reverse().find((comment) => comment.body?.includes(marker))
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body,
+              })
+            }
+
+            if (automationError) {
+              core.setFailed(automationError)
+            }

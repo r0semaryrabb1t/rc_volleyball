@@ -1,9 +1,10 @@
 name: CodeQL
 
 on:
-  pull_request:
+  push:
     branches:
-      - "**"
+      - master
+      - main
   schedule:
     # 每周一 02:00 UTC 执行安全扫描。
     - cron: "0 2 * * 1"

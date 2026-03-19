@@ -398,19 +398,29 @@ ros2 run motor_control_ros2 motor_control_node
 
 ## 🔁 Pull Request 标准工作流
 
-为降低多人协作时的架构漂移风险，仓库已提供以下 PR 自动检查：
+为降低多人协作时的架构漂移风险，仓库现在统一使用一个 `PR CI` workflow 文件处理 PR 自动化：
 
-- `PR CI`：自动执行 ROS2 依赖安装、`colcon build`、`colcon test`
-- `PR Title Check`：强制 PR 标题使用规范前缀（`feat/fix/docs/refactor/test/chore/ci`），格式为 `<type>: <description>`（例如 `feat: add chassis control`）
-- `CodeQL`：自动执行 C++/Python 安全扫描
-- `CODEOWNERS`：核心目录改动默认请求代码所有者评审
+- `Semantic PR title`：校验 PR 标题必须使用 `feat/fix/docs/refactor/test/chore/ci` 前缀，格式为 `<type>: <description>`
+- `ROS build and test`：执行工作区校验、ROS2 依赖安装、`colcon build`、`colcon test`
+- `PR gate`：聚合前两项检查结果，作为 branch protection 中唯一需要勾选的 required check
+- `PR automation`：在 PR 中维护一条固定机器人汇总评论；当检查通过时，自动提交 bot approval，并尝试启用 squash auto-merge
+- `CODEOWNERS`：保留 ownership 声明，用于 reviewer 提示
 - `pull_request_template.md`：统一 PR 描述与自检清单
+- `CodeQL`：不再在 PR 上运行，只保留默认分支 push 与定时安全扫描
 
-建议在仓库 Settings → Branches 中开启分支保护：
+补充说明：
 
-1. Require a pull request before merging
-2. Require approvals（至少 1 位 reviewer）
-3. Require status checks to pass before merging（勾选 `PR CI`、`PR Title Check`、`CodeQL`）
+- 同仓库 PR 和 fork PR 都会执行相同检查
+- 固定汇总评论会被更新，不会重复新增多条评论
+- 自动审批与 squash auto-merge 也会尝试覆盖 fork PR，但是否最终生效仍取决于仓库权限、branch protection 与 GitHub 对 fork PR 的限制
+
+建议在仓库 Settings → Branches 中确认：
+
+1. 开启 `Allow auto-merge`
+2. Require a pull request before merging
+3. 先把这份 workflow 推到远端并让 PR 实际跑一次；GitHub 只会显示最近出现过的 checks
+4. Require status checks to pass before merging（只勾选 `PR gate`）
+5. 若目标是全自动合并，确认不存在阻塞 bot 的强制人工审批 / 强制 Code Owner 审批设置
 
 ## 📖 相关文档
 
