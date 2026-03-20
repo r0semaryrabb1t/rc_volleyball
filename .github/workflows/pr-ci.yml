@@ -132,7 +132,6 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      workflows: write
     steps:
       - name: Wait for checks, update summary, and enable merge automation
         uses: actions/github-script@v7
@@ -158,6 +157,81 @@ jobs:
                 /refusing to allow a github app to create or update \bworkflow\b/i.test(message) ||
                 /create or update \bworkflow\b .* without `?\bworkflows\b`? permission/i.test(message)
               )
+            }
+            const forkWorkflowApprovalStatuses = new Set(['action_required', 'requested', 'waiting', 'pending'])
+            const forkWorkflowSensitivePrefixes = ['.github/workflows/', '.github/actions/']
+            const approvedWorkflowRunIds = new Set()
+            let changedFiles = null
+            let forkWorkflowApprovalStatus = sourceLabel === 'fork PR' ? 'not_needed' : 'not_applicable'
+            let forkWorkflowApprovalMessage = null
+
+            async function listPullFiles() {
+              if (!changedFiles) {
+                changedFiles = await github.paginate(github.rest.pulls.listFiles, {
+                  owner,
+                  repo,
+                  pull_number: pullNumber,
+                  per_page: 100,
+                })
+              }
+              return changedFiles
+            }
+
+            async function touchesSensitiveWorkflowPaths() {
+              const files = await listPullFiles()
+              return files.some((file) =>
+                forkWorkflowSensitivePrefixes.some((prefix) => file.filename.startsWith(prefix)),
+              )
+            }
+
+            async function maybeApproveForkWorkflowRun(run) {
+              if (sourceLabel !== 'fork PR') {
+                return null
+              }
+
+              if (!forkWorkflowApprovalStatuses.has(run.status)) {
+                return null
+              }
+
+              if (await touchesSensitiveWorkflowPaths()) {
+                forkWorkflowApprovalStatus = 'manual_required'
+                forkWorkflowApprovalMessage = '检测到 workflow 变更，需维护者手动批准外部 fork workflow'
+                return {
+                  reason: 'manual_approval_required',
+                  message: forkWorkflowApprovalMessage,
+                }
+              }
+
+              if (approvedWorkflowRunIds.has(run.id)) {
+                return null
+              }
+
+              try {
+                await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve', {
+                  owner,
+                  repo,
+                  run_id: run.id,
+                })
+                approvedWorkflowRunIds.add(run.id)
+                forkWorkflowApprovalStatus = 'approved'
+                core.info(`Approved workflow run ${run.id} for fork PR #${pullNumber}.`)
+              } catch (error) {
+                const message = formatError(error)
+                if (/already approved/i.test(message) || /not awaiting approval/i.test(message)) {
+                  approvedWorkflowRunIds.add(run.id)
+                  forkWorkflowApprovalStatus = 'not_needed'
+                  return null
+                }
+
+                forkWorkflowApprovalStatus = 'failed'
+                forkWorkflowApprovalMessage = message
+                return {
+                  reason: 'approval_failed',
+                  message: `自动批准外部 fork workflow 失败：${message}`,
+                }
+              }
+
+              return null
             }
 
             const renderResult = (result) => {
@@ -204,6 +278,19 @@ jobs:
 
                 if (!run) {
                   core.info('Waiting for pull_request workflow run to start.')
+                  await sleep(15000)
+                  continue
+                }
+
+                const forkApprovalAttempt = await maybeApproveForkWorkflowRun(run)
+                if (forkApprovalAttempt?.reason === 'manual_approval_required') {
+                  throw new Error(forkApprovalAttempt.message)
+                }
+                if (forkApprovalAttempt?.reason === 'approval_failed') {
+                  throw new Error(forkApprovalAttempt.message)
+                }
+                if (forkWorkflowApprovalStatuses.has(run.status)) {
+                  core.info(`Waiting for workflow run ${run.id} to leave approval state (${run.status}).`)
                   await sleep(15000)
                   continue
                 }
@@ -259,6 +346,25 @@ jobs:
             const allPassed = gateResult === 'success'
             const failedJobs = detailResults.filter((job) => job.result !== 'success').map((job) => job.name)
             const automationLines = [`- PR 来源：${sourceLabel}`, `- 汇总门禁（PR gate）：${renderResult(gateResult)}`]
+            if (sourceLabel === 'fork PR') {
+              switch (forkWorkflowApprovalStatus) {
+                case 'approved':
+                  automationLines.push('- 外部 fork workflow：已自动批准运行')
+                  break
+                case 'manual_required':
+                  automationLines.push('- 外部 fork workflow：需维护者手动批准（检测到 workflow 变更）')
+                  break
+                case 'failed':
+                  automationLines.push(`- 外部 fork workflow：自动批准失败（${forkWorkflowApprovalMessage})`)
+                  break
+                case 'not_needed':
+                  automationLines.push('- 外部 fork workflow：无需额外批准')
+                  break
+                default:
+                  automationLines.push('- 外部 fork workflow：未处理')
+                  break
+              }
+            }
             let automationError = null
 
             if (pull.draft) {
