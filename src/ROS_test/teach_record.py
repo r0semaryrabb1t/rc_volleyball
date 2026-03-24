@@ -9,12 +9,12 @@
   4. Ctrl+C 停止录制，自动保存 JSON 文件
 
 参数:
-  --tau-inner   大臂重力矩 Nm (默认 8.3)
-  --tau-outer   小臂重力矩 Nm (默认 2.0)
-  --kd          转子侧阻尼 (默认 0.02)
+  --tau-inner   大臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 8.3)
+  --tau-outer   小臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 2.0)
+  --kd          转子侧阻尼 (默认 0.005)
   --ramp        斜坡时间 s (默认 1.5)
   --rate        采样频率 Hz (默认 200)
-  --output      输出文件名 (默认 teach_data.json)
+  --output      输出文件名 (默认 teach_data.json, 追加模式, 最多保留10条)
 """
 
 import rclpy
@@ -161,7 +161,8 @@ class TeachRecorder:
                 self._brake_all()
                 break
 
-            rclpy.spin_once(self.node, timeout_sec=0)
+            for _ in range(16):  # 排空全部待处理消息(4电机×~4帧)
+                rclpy.spin_once(self.node, timeout_sec=0)
 
             # 重力补偿
             ramp = self.smoothstep(min(1.0, elapsed / self.ramp_time)) if self.ramp_time > 0 else 1.0
@@ -197,20 +198,42 @@ class TeachRecorder:
             print("[WARN] 无数据")
             return
 
-        data = {
+        MAX_RECORDINGS = 10
+
+        new_rec = {
             'rate_hz': self.rate_hz,
             'tau_inner': self.tau_inner,
             'tau_outer': self.tau_outer,
             'n_frames': len(self.records),
             'duration': self.records[-1]['t'],
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'frames': self.records,
         }
 
-        with open(self.output, 'w') as f:
-            json.dump(data, f, indent=2)
+        # 读取已有文件，追加到录制列表
+        recordings = []
+        try:
+            with open(self.output, 'r') as f:
+                existing = json.load(f)
+            if 'recordings' in existing:
+                recordings = existing['recordings']
+            elif 'frames' in existing:
+                # 兼容旧单录制格式，迁移为列表
+                recordings = [existing]
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
 
+        recordings.append(new_rec)
+        # 只保留最近 MAX_RECORDINGS 条
+        if len(recordings) > MAX_RECORDINGS:
+            recordings = recordings[-MAX_RECORDINGS:]
+
+        with open(self.output, 'w') as f:
+            json.dump({'recordings': recordings}, f, indent=2)
+
+        idx = len(recordings) - 1
         print(f"\n{'='*60}")
-        print(f"  录制完成")
+        print(f"  录制完成 (#{idx}, 共 {len(recordings)} 条)")
         print(f"  帧数: {len(self.records)}")
         print(f"  时长: {self.records[-1]['t']:.2f}s")
         print(f"  文件: {self.output}")
@@ -225,18 +248,18 @@ class TeachRecorder:
 
 def main():
     parser = argparse.ArgumentParser(description='示教录制')
-    parser.add_argument('--tau-inner', type=float, default=8.3,
-                        help='大臂重力矩 Nm (默认 8.3)')
-    parser.add_argument('--tau-outer', type=float, default=2.0,
-                        help='小臂重力矩 Nm (默认 2.0)')
-    parser.add_argument('--kd', type=float, default=0.02,
-                        help='转子侧阻尼 (默认 0.02)')
+    parser.add_argument('--tau-inner', type=float, default=0,
+                        help='大臂重力矩 Nm (默认 0)')
+    parser.add_argument('--tau-outer', type=float, default=0,
+                        help='小臂重力矩 Nm (默认 0)')
+    parser.add_argument('--kd', type=float, default=0.005,
+                        help='转子侧阻尼 (默认 0.005)')
     parser.add_argument('--ramp', type=float, default=1.5,
                         help='斜坡时间 s (默认 1.5)')
     parser.add_argument('--rate', type=int, default=200,
                         help='采样频率 Hz (默认 200)')
     parser.add_argument('--output', type=str, default='teach_data.json',
-                        help='输出文件 (默认 teach_data.json)')
+                        help='输出文件 (默认 teach_data.json, 追加模式最多保留10条)')
     args = parser.parse_args()
 
     recorder = TeachRecorder(args)

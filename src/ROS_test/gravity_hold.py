@@ -219,7 +219,8 @@ class GravityHold:
                     self._brake_all()
                     break
 
-            rclpy.spin_once(self.node, timeout_sec=0)
+            for _ in range(16):  # 排空全部待处理消息
+                rclpy.spin_once(self.node, timeout_sec=0)
 
             ramp = self.ramp_factor(elapsed)
             snapshot = {}

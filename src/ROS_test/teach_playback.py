@@ -16,29 +16,30 @@
   - τ_ff_vel: 前馈速度补偿 (kd * ω_des 已隐含，此处用速度前馈信号)
   - kp/kd: 位置+阻尼跟踪
 
-三阶段:
-  1. ramp: 重力补偿斜坡 + 从当前位置平滑移动到轨迹起点
-  2. playback: 跟踪回放平滑后的示教轨迹
-  3. hold: 保持在轨迹终点
+阶段 (可选):
+  1. ramp: 重力补偿斜坡 (默认跳过, --ramp 设>0启用)
+  2. goto: 平滑移动到轨迹起点 (默认跳过, --goto-time 设>0启用)
+  3. playback: 跟踪回放平滑后的示教轨迹
+  4. hold: 保持在轨迹终点
 
 参数:
   --input        示教数据文件 (默认 teach_data.json)
-  --kp           转子侧位置增益 (默认 3.0)
+  --kp           转子侧位置增益 (默认 1.0)
   --kd           转子侧阻尼 (默认 0.15)
   --speed        回放速度倍率 (默认 1.0, >1 加快, <1 减慢)
-  --smooth       Savitzky-Golay 窗口大小 (默认 31, 奇数)
+  --smooth       Savitzky-Golay 窗口大小 (默认 101, 奇数)
   --spike-thresh 毛刺检测速度阈值 rad/s (默认 20.0)
   --ramp         斜坡时间 s (默认 1.5)
   --goto-time    移动到起点时间 s (默认 2.0)
   --hold-time    保持时间 s (默认 3.0)
-  --tau-inner    大臂重力矩 Nm (默认 8.3)
-  --tau-outer    小臂重力矩 Nm (默认 2.0)
+  --tau-inner    大臂重力矩 Nm (自动从示教文件读取)
+  --tau-outer    小臂重力矩 Nm (自动从示教文件读取)
   --rate         回放控制频率 Hz (默认 200)
 
 用法:
   python3 teach_playback.py
   python3 teach_playback.py --input teach_data.json --kp 3.0 --speed 0.8
-  python3 teach_playback.py --smooth 51 --speed 1.5
+  python3 teach_playback.py --smooth 101 --speed 1.5
 """
 
 import rclpy
@@ -49,6 +50,7 @@ import argparse
 import signal
 import json
 import numpy as np
+from scipy.signal import savgol_filter
 
 GEAR_RATIO = 6.33
 ALL_IDS = [0, 1, 2, 3]
@@ -129,40 +131,28 @@ class TrajectoryProcessor:
         if window > self.n:
             window = max(self.n // 2 * 2 - 1, 5)
 
-        # 手动实现 Savitzky-Golay (避免 scipy 依赖)
-        # 使用3阶多项式，窗口内最小二乘拟合
-        half = window // 2
         poly_order = min(3, window - 2)
 
         for mid in ALL_IDS:
-            raw = self.pos[mid].copy()
-            smoothed = raw.copy()
-
-            for i in range(half, self.n - half):
-                # 窗口数据
-                idx = np.arange(i - half, i + half + 1)
-                x = idx - i  # 以中心点为原点
-                y = raw[idx]
-                # 多项式拟合
-                coeffs = np.polyfit(x, y, poly_order)
-                smoothed[i] = np.polyval(coeffs, 0)  # 中心点的拟合值
-
-            self.pos[mid] = smoothed
+            self.pos[mid] = savgol_filter(self.pos[mid], window, poly_order, mode='mirror')
 
         print(f"  [处理] Savitzky-Golay 平滑: 窗口={window}, 阶数={poly_order}")
 
     def _compute_derivatives(self):
-        """中心差分计算速度和加速度"""
+        """SG 滤波器直接计算平滑导数"""
         dt = self.t[1] - self.t[0] if self.n > 1 else 1.0 / self.rate_hz
+        window = self.smooth_window
+        if window % 2 == 0:
+            window += 1
+        if window > self.n:
+            window = max(self.n // 2 * 2 - 1, 5)
+        poly_order = min(3, window - 2)
+
         self.vel = {}
         self.acc = {}
         for mid in ALL_IDS:
-            # 速度: 中心差分
-            v = np.gradient(self.pos[mid], dt)
-            self.vel[mid] = v
-            # 加速度: 中心差分
-            a = np.gradient(v, dt)
-            self.acc[mid] = a
+            self.vel[mid] = savgol_filter(self.pos[mid], window, poly_order, deriv=1, delta=dt, mode='mirror')
+            self.acc[mid] = savgol_filter(self.pos[mid], window, poly_order, deriv=2, delta=dt, mode='mirror')
 
     def get_state(self, t):
         """插值获取 t 时刻的 (pos, vel) for each motor"""
@@ -197,14 +187,27 @@ class TeachPlayback:
         self.ramp_time = args.ramp
         self.goto_time = args.goto_time
         self.hold_time = args.hold_time
-        self.tau_inner = args.tau_inner
-        self.tau_outer = args.tau_outer
         self.rate_hz = args.rate
 
         # 加载并处理示教数据
         print(f"[INFO] 加载示教数据: {args.input}")
         with open(args.input, 'r') as f:
-            data = json.load(f)
+            raw = json.load(f)
+
+        # 兼容多录制 / 旧单录制格式
+        if 'recordings' in raw:
+            recs = raw['recordings']
+            ri = args.rec if args.rec is not None else -1
+            data = recs[ri]
+            print(f"[INFO] 共 {len(recs)} 条录制, 使用第 {ri % len(recs)} 条"
+                  f" ({data.get('timestamp', '?')}  {data.get('duration', 0):.1f}s  {data.get('n_frames', '?')}帧)")
+        else:
+            data = raw
+
+        # tau 优先使用 JSON 中录制时保存的值，保证录制/回放一致
+        self.tau_inner = data.get('tau_inner', args.tau_inner)
+        self.tau_outer = data.get('tau_outer', args.tau_outer)
+        print(f"[INFO] 重力补偿来自示教文件: 大臂={self.tau_inner}Nm 小臂={self.tau_outer}Nm")
 
         self.traj = TrajectoryProcessor(
             data['frames'],
@@ -359,7 +362,8 @@ class TeachPlayback:
                     self._brake_all()
                     break
 
-            rclpy.spin_once(self.node, timeout_sec=0)
+            for _ in range(16):
+                rclpy.spin_once(self.node, timeout_sec=0)
             theta1, theta2 = self.get_theta_pair()
 
             # === 状态机 ===
@@ -459,20 +463,22 @@ def main():
     parser = argparse.ArgumentParser(description='示教回放')
     parser.add_argument('--input', type=str, default='teach_data.json',
                         help='示教数据文件 (默认 teach_data.json)')
+    parser.add_argument('--rec', type=int, default=None,
+                        help='选择第几条录制 (默认 -1 最新, 0=第一条)')
 
-    parser.add_argument('--kp', type=float, default=3.0,
-                        help='轨迹跟踪 kp (转子侧, 默认 3.0)')
+    parser.add_argument('--kp', type=float, default=1.0,
+                        help='轨迹跟踪 kp (转子侧, 默认 1.0)')
     parser.add_argument('--kd', type=float, default=0.15,
                         help='轨迹跟踪 kd (转子侧, 默认 0.15)')
-    parser.add_argument('--kp-hold', type=float, default=2.0,
-                        help='保持阶段 kp (默认 2.0)')
-    parser.add_argument('--kd-hold', type=float, default=0.3,
-                        help='保持阶段 kd (默认 0.3, 高阻尼)')
-    parser.add_argument('--speed', type=float, default=1.0,
+    parser.add_argument('--kp-hold', type=float, default=1.0,
+                        help='保持阶段 kp (默认 1.0)')
+    parser.add_argument('--kd-hold', type=float, default=0.15,
+                        help='保持阶段 kd (默认 0.15)')
+    parser.add_argument('--speed', type=float, default=2.0,
                         help='回放速度倍率 (默认 1.0)')
 
-    parser.add_argument('--smooth', type=int, default=31,
-                        help='Savitzky-Golay 窗口大小 (默认 31, 奇数)')
+    parser.add_argument('--smooth', type=int, default=101,
+                        help='Savitzky-Golay 窗口大小 (默认 101, 奇数)')
     parser.add_argument('--spike-thresh', type=float, default=20.0,
                         help='毛刺检测速度阈值 rad/s (默认 20.0)')
 
@@ -480,11 +486,11 @@ def main():
                         help='大臂重力矩 Nm (默认 8.3)')
     parser.add_argument('--tau-outer', type=float, default=2.0,
                         help='小臂重力矩 Nm (默认 2.0)')
-    parser.add_argument('--ramp', type=float, default=1.5,
-                        help='重力补偿斜坡时间 s (默认 1.5)')
-    parser.add_argument('--goto-time', type=float, default=2.0,
-                        help='移动到起点时间 s (默认 2.0)')
-    parser.add_argument('--hold-time', type=float, default=3.0,
+    parser.add_argument('--ramp', type=float, default=0.0,
+                        help='重力补偿斜坡时间 s (默认 0, 跳过)')
+    parser.add_argument('--goto-time', type=float, default=0.0,
+                        help='移动到起点时间 s (默认 0, 跳过)')
+    parser.add_argument('--hold-time', type=float, default=0.0,
                         help='保持时间 s (默认 3.0)')
     parser.add_argument('--rate', type=int, default=200,
                         help='控制频率 Hz (默认 200)')
