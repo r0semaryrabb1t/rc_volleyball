@@ -240,6 +240,28 @@ set_target_properties(delta_arm_manager PROPERTIES
   INSTALL_RPATH "$ORIGIN"
 )
 
+# C++ 可执行文件 - 示教回放控制节点
+find_package(nlohmann_json REQUIRED)
+
+add_executable(teach_playback_control_node
+  src/teach_playback_control_node.cpp
+)
+
+target_link_libraries(teach_playback_control_node
+  "${cpp_typesupport_target}"
+  nlohmann_json::nlohmann_json
+)
+
+ament_target_dependencies(teach_playback_control_node
+  rclcpp
+  std_msgs
+  sensor_msgs
+)
+
+set_target_properties(teach_playback_control_node PROPERTIES
+  INSTALL_RPATH "$ORIGIN"
+)
+
 # 安装目标
 install(TARGETS
   motor_control_lib
@@ -250,6 +272,7 @@ install(TARGETS
   joystick_control_node
   remote_control_node
   delta_arm_manager
+  teach_playback_control_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
