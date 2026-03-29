@@ -127,15 +127,16 @@ class QuinticTrajectory:
 
 # ====================== 简化动力学前馈 ======================
 
-def gravity_torque(theta1, theta2, tau_inner, tau_outer):
+def gravity_torque(theta1, theta2, tau_inner, tau_outer, gravity_offset=-math.pi/2):
     """
     重力补偿力矩 (输出轴侧)
-    大臂: tau_inner * cos(θ₁)
-    小臂: tau_outer * cos(θ₁ + θ₂)  ← 注意用绝对角度θ₁+θ₂
+    大臂: tau_inner * cos(θ₁ + gravity_offset)
+    小臂: tau_outer * cos(θ₁ + θ₂ + gravity_offset)  ← 注意用绝对角度θ₁+θ₂
+    gravity_offset: 零位与水平方向的角度差 (默认 -π/2, 即零位=竖直向下)
     返回 [tau1, tau2] (输出轴侧 Nm)
     """
-    tau1 = tau_inner * math.cos(theta1)
-    tau2 = tau_outer * math.cos(theta1 + theta2)
+    tau1 = tau_inner * math.cos(theta1 + gravity_offset)
+    tau2 = tau_outer * math.cos(theta1 + theta2 + gravity_offset)
     return np.array([tau1, tau2])
 
 
@@ -170,6 +171,7 @@ class StrikeController:
     def __init__(self, args):
         self.tau_inner = args.tau_inner
         self.tau_outer = args.tau_outer
+        self.gravity_offset = args.gravity_offset
         self.kp = args.kp
         self.kd = args.kd
         self.kp_hold = args.kp_hold
@@ -374,7 +376,7 @@ class StrikeController:
                 ramp_frac = self.smoothstep(min(1.0, elapsed / self.ramp_time)) if self.ramp_time > 0 else 1.0
 
                 # 斜坡期: 重力补偿缓升, 位置保持当前
-                g_tau = gravity_torque(theta1_cur, theta2_cur, self.tau_inner, self.tau_outer)
+                g_tau = gravity_torque(theta1_cur, theta2_cur, self.tau_inner, self.tau_outer, self.gravity_offset)
                 for mid in ALL_IDS:
                     pos = self.positions.get(mid, 0.0)
                     idx = 0 if mid in INNER_IDS else 1
@@ -402,7 +404,7 @@ class StrikeController:
                     q_d, qdot_d, qddot_d = self.traj.evaluate(t_traj)
 
                     # 前馈力矩: 重力 + 惯性
-                    g_tau = gravity_torque(q_d[0], q_d[1], self.tau_inner, self.tau_outer)
+                    g_tau = gravity_torque(q_d[0], q_d[1], self.tau_inner, self.tau_outer, self.gravity_offset)
                     i_tau = inertia_torque(q_d[0], q_d[1], qddot_d, self.m1, self.m2)
                     tau_ff_joint = g_tau + i_tau  # 输出轴侧 Nm
 
@@ -415,7 +417,7 @@ class StrikeController:
                 # fall through to hold if phase just changed
                 if phase == 'hold':
                     g_tau = gravity_torque(self.strike_theta1, self.strike_theta2,
-                                          self.tau_inner, self.tau_outer)
+                                          self.tau_inner, self.tau_outer, self.gravity_offset)
                     for mid in ALL_IDS:
                         idx = 0 if mid in INNER_IDS else 1
                         tau_ff_rotor = g_tau[idx] / GEAR_RATIO
@@ -430,7 +432,7 @@ class StrikeController:
                     break
 
                 g_tau = gravity_torque(self.strike_theta1, self.strike_theta2,
-                                       self.tau_inner, self.tau_outer)
+                                       self.tau_inner, self.tau_outer, self.gravity_offset)
                 for mid in ALL_IDS:
                     idx = 0 if mid in INNER_IDS else 1
                     tau_ff_rotor = g_tau[idx] / GEAR_RATIO
@@ -516,10 +518,12 @@ def main():
                         help='保持阶段 kd (转子侧, 默认 0.3, 高阻尼减速)')
 
     # 重力补偿
-    parser.add_argument('--tau-inner', type=float, default=8.3,
-                        help='大臂重力矩 Nm (默认 8.3)')
-    parser.add_argument('--tau-outer', type=float, default=2.0,
-                        help='小臂重力矩 Nm (默认 2.0)')
+    parser.add_argument('--tau-inner', type=float, default=3.1,
+                        help='大臂重力矩 Nm (默认 3.1)')
+    parser.add_argument('--tau-outer', type=float, default=1.5,
+                        help='小臂重力矩 Nm (默认 1.5)')
+    parser.add_argument('--gravity-offset', type=float, default=-math.pi/2,
+                        help='零位与水平方向的角度差 rad (默认 -π/2, 即零位=竖直向下)')
 
     # 惯性前馈质量参数
     parser.add_argument('--m1', type=float, default=0.5,

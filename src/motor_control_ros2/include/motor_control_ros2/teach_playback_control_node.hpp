@@ -18,9 +18,9 @@ namespace motor_control {
 /**
  * @brief 示教回放控制节点
  *
- * 状态机: CALIBRATING → IDLE → GOTO_START → PLAYBACK → HOLD → RETURN → IDLE
+ * 状态机: IDLE → GOTO_START → PLAYBACK → HOLD → RETURN → IDLE
  *
- * 启动后自动零位校准，IDLE 保持零位 + 重力补偿。
+ * 启动前请手动校准零位。IDLE 保持零位 + 重力补偿。
  * 收到触发信号后: 移至起点 → 回放轨迹 → 短暂保持 → 回零。
  *
  * 触发源:
@@ -52,15 +52,20 @@ struct TeachFrame {
     std::array<double, 4> vel;  // v0, v1, v2, v3
 };
 
-// 处理后的轨迹
+// 处理后的轨迹（Reinsch 平滑样条）
 struct ProcessedTrajectory {
     double duration;
     int n_frames;
-    std::vector<double> t;                    // 均匀时间轴
-    std::array<std::vector<double>, 4> pos;   // 平滑后位置
-    std::array<std::vector<double>, 4> vel;   // 平滑后速度
+    std::vector<double> t;                    // 原始时间轴（归零后）
+    std::array<std::vector<double>, 4> pos;   // 节点位置（去毛刺后）
 
-    // 插值获取 t 时刻状态
+    // 三次样条系数: S_i(x) = a + b*(x-x_i) + c*(x-x_i)^2 + d*(x-x_i)^3
+    struct SplineCoeffs {
+        std::vector<double> a, b, c, d;       // 各段系数, 长度 = n_frames - 1
+    };
+    std::array<SplineCoeffs, 4> spline;       // 4 个电机各一组
+
+    // 通过样条插值获取 t 时刻的位置和速度
     void get_state(double time, std::array<double, 4>& out_pos,
                    std::array<double, 4>& out_vel) const;
 };
@@ -83,7 +88,7 @@ private:
     // ── 轨迹处理 ──
     ProcessedTrajectory process_frames(
         const std::vector<TeachFrame>& frames,
-        int rate_hz, int smooth_window, double spike_thresh);
+        double smooth_factor, double spike_thresh);
 
     // ── 回调 ──
     void state_callback(
@@ -113,10 +118,11 @@ private:
     double kp_, kd_;
     double kp_hold_, kd_hold_;
     double speed_;
-    int smooth_window_;
+    double smooth_factor_;
     double spike_thresh_;
     double tau_inner_, tau_outer_;
-    double goto_time_, return_time_, hold_time_;
+    double gravity_offset_inner_, gravity_offset_outer_;
+    double goto_time_, hold_time_;
     int rate_hz_;
     std::string trigger_source_;
     int joy_button_;

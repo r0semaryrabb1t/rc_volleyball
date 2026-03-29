@@ -283,10 +283,10 @@ class MoveToPosition:
 
 def main():
     parser = argparse.ArgumentParser(description='重力补偿 + 小kp位置运动')
-    parser.add_argument('--tau-inner', type=float, default=8.3,
-                        help='M0/M2 大臂重力矩 Nm (默认 8.3)')
-    parser.add_argument('--tau-outer', type=float, default=2.0,
-                        help='M1/M3 小臂重力矩 Nm (默认 2.0)')
+    parser.add_argument('--tau-inner', type=float, default=3.1,
+                        help='M0/M2 大臂重力矩 Nm (默认 3.1)')
+    parser.add_argument('--tau-outer', type=float, default=1.5,
+                        help='M1/M3 小臂重力矩 Nm (默认 1.5)')
     parser.add_argument('--kp', type=float, default=0.1,
                         help='转子侧位置增益 (默认 0.1)')
     parser.add_argument('--kd', type=float, default=0.02,

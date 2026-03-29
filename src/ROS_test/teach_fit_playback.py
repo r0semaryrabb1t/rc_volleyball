@@ -138,6 +138,7 @@ class FitPlayback:
         # tau 从 JSON 读取
         self.tau_inner = data.get('tau_inner', 0.0)
         self.tau_outer = data.get('tau_outer', 0.0)
+        self.gravity_offset = args.gravity_offset
         print(f"[INFO] 重力补偿: 大臂={self.tau_inner}Nm 小臂={self.tau_outer}Nm")
 
         # 多项式拟合
@@ -200,10 +201,10 @@ class FitPlayback:
 
     def gravity_torque_rotor(self, mid, theta1, theta2):
         if mid in INNER_IDS:
-            return self.tau_inner * math.cos(theta1) / GEAR_RATIO
+            return self.tau_inner * math.cos(theta1 + self.gravity_offset) / GEAR_RATIO
         else:
             abs_angle = theta1 + theta2
-            return -self.tau_outer * math.cos(abs_angle) / GEAR_RATIO
+            return -self.tau_outer * math.cos(abs_angle + self.gravity_offset) / GEAR_RATIO
 
     def check_safety(self):
         for mid in ALL_IDS:
@@ -334,6 +335,8 @@ def main():
                         help='电机转子惯量 kg·m² (默认 3.3e-5, GO-M8010-6)')
     parser.add_argument('--hold-time', type=float, default=3.0,
                         help='保持时间 s (默认 3.0)')
+    parser.add_argument('--gravity-offset', type=float, default=-1.5708,
+                        help='零位到水平的角度偏移 rad (默认 -π/2, 零位=下垂)')
     parser.add_argument('--rate', type=int, default=200,
                         help='控制频率 Hz (默认 200)')
 

@@ -170,6 +170,7 @@ class StrikeController:
     def __init__(self, args):
         self.tau_inner = args.tau_inner
         self.tau_outer = args.tau_outer
+        self.gravity_offset = args.gravity_offset
         self.kd = args.kd
         self.ramp_time = args.ramp
         self.max_time = args.traj_time
@@ -234,9 +235,15 @@ class StrikeController:
         t = max(0.0, min(1.0, t))
         return t * t * (3.0 - 2.0 * t)
 
-    def gravity_torque_rotor(self, motor_id, angle_rad, ramp=1.0):
-        tau = self.tau_inner if motor_id in INNER_IDS else self.tau_outer
-        return tau * math.cos(angle_rad) / GEAR_RATIO * ramp
+    def gravity_torque_rotor(self, motor_id, theta1, theta2, ramp=1.0):
+        """重力补偿力矩(转子侧). 外臂用绝对角度 θ₁+θ₂"""
+        if motor_id in INNER_IDS:
+            tau = self.tau_inner
+            angle = theta1
+        else:
+            tau = self.tau_outer
+            angle = theta1 + theta2
+        return tau * math.cos(angle + self.gravity_offset) / GEAR_RATIO * ramp
 
     def get_current_joint(self):
         """获取当前关节角度（取对称电机的均值）"""
@@ -353,9 +360,10 @@ class StrikeController:
             if phase == 'ramp':
                 ramp_frac = self.smoothstep(min(1.0, elapsed / self.ramp_time)) if self.ramp_time > 0 else 1.0
                 # 斜坡期: 重力补偿缓升，位置保持当前
+                theta1_r, theta2_r = self.get_current_joint()
                 for mid in ALL_IDS:
                     pos = self.positions.get(mid, 0.0)
-                    tau_ff = self.gravity_torque_rotor(mid, pos, ramp_frac)
+                    tau_ff = self.gravity_torque_rotor(mid, theta1_r, theta2_r, ramp_frac)
                     self._send_cmd(mid, tau_ff, 0.0, self.kd, pos)
 
                 if elapsed >= self.ramp_time:
@@ -408,7 +416,7 @@ class StrikeController:
                 # 发送命令（4电机）
                 for mid in ALL_IDS:
                     pos = self.positions.get(mid, 0.0)
-                    tau_ff = self.gravity_torque_rotor(mid, pos)
+                    tau_ff = self.gravity_torque_rotor(mid, theta1_d, theta2_d)
                     if mid in INNER_IDS:
                         p_des, v_des = theta1_d, qdot1
                     else:
@@ -425,7 +433,7 @@ class StrikeController:
                 # 保持在击球点（重力补偿 + kp 锁定）
                 for mid in ALL_IDS:
                     pos = self.positions.get(mid, 0.0)
-                    tau_ff = self.gravity_torque_rotor(mid, pos)
+                    tau_ff = self.gravity_torque_rotor(mid, self.strike_theta1, self.strike_theta2)
                     if mid in INNER_IDS:
                         p_des = self.strike_theta1
                     else:
@@ -491,10 +499,12 @@ def main():
                         help='轨迹执行时间 s (默认 5.0，smoothstep平滑启停)')
 
     # 重力补偿
-    parser.add_argument('--tau-inner', type=float, default=8.3,
-                        help='大臂重力矩 Nm (默认 8.3)')
-    parser.add_argument('--tau-outer', type=float, default=2.0,
-                        help='小臂重力矩 Nm (默认 2.0)')
+    parser.add_argument('--tau-inner', type=float, default=3.1,
+                        help='大臂重力矩 Nm (默认 3.1)')
+    parser.add_argument('--tau-outer', type=float, default=1.5,
+                        help='小臂重力矩 Nm (默认 1.5)')
+    parser.add_argument('--gravity-offset', type=float, default=-math.pi/2,
+                        help='零位与水平方向的角度差 rad (默认 -π/2, 即零位=竖直向下)')
     parser.add_argument('--kd', type=float, default=0.02,
                         help='转子阻尼 (默认 0.02)')
     parser.add_argument('--kp-hold', type=float, default=0.5,

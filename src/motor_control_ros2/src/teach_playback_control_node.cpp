@@ -26,18 +26,22 @@ void ProcessedTrajectory::get_state(
 {
     time = std::clamp(time, 0.0, duration);
 
-    // 二分搜索找到 time 所在的区间
+    // 二分搜索找到 time 所在区间 [t[idx-1], t[idx])
     auto it = std::lower_bound(t.begin(), t.end(), time);
     int idx = static_cast<int>(std::distance(t.begin(), it));
-    if (idx >= n_frames) idx = n_frames - 1;
-    if (idx <= 0) idx = 1;
+    // 映射到段索引 i, 使得 t[i] <= time < t[i+1]
+    int seg = idx - 1;
+    if (seg < 0) seg = 0;
+    if (seg >= n_frames - 1) seg = n_frames - 2;
 
-    double t0 = t[idx - 1], t1 = t[idx];
-    double alpha = (t1 > t0) ? (time - t0) / (t1 - t0) : 0.0;
+    double dx = time - t[seg];
 
     for (int m = 0; m < 4; ++m) {
-        out_pos[m] = pos[m][idx - 1] + alpha * (pos[m][idx] - pos[m][idx - 1]);
-        out_vel[m] = vel[m][idx - 1] + alpha * (vel[m][idx] - vel[m][idx - 1]);
+        const auto& s = spline[m];
+        // S(x) = a + b*dx + c*dx^2 + d*dx^3
+        out_pos[m] = s.a[seg] + dx * (s.b[seg] + dx * (s.c[seg] + dx * s.d[seg]));
+        // S'(x) = b + 2*c*dx + 3*d*dx^2
+        out_vel[m] = s.b[seg] + dx * (2.0 * s.c[seg] + 3.0 * s.d[seg] * dx);
     }
 }
 
@@ -45,7 +49,7 @@ void ProcessedTrajectory::get_state(
 
 ProcessedTrajectory TeachPlaybackControlNode::process_frames(
     const std::vector<TeachFrame>& frames,
-    int rate_hz, int smooth_window, double spike_thresh)
+    int /* rate_hz */, int /* smooth_window */, double spike_thresh)
 {
     int n_raw = static_cast<int>(frames.size());
     std::vector<double> raw_t(n_raw);
@@ -59,7 +63,8 @@ ProcessedTrajectory TeachPlaybackControlNode::process_frames(
         }
     }
 
-    double duration = raw_t.back() - raw_t.front();
+    double t_start = raw_t.front();
+    double duration = raw_t.back() - t_start;
 
     // 毛刺去除
     for (int m = 0; m < 4; ++m) {
@@ -93,164 +98,95 @@ ProcessedTrajectory TeachPlaybackControlNode::process_frames(
         }
     }
 
-    // 均匀重采样
-    int n = std::max(static_cast<int>(duration * rate_hz), 10);
+    // 去重复时间戳 (保留最后一个)
+    std::vector<int> keep;
+    for (int i = 0; i < n_raw; ++i) {
+        if (i + 1 < n_raw && raw_t[i + 1] <= raw_t[i]) continue;
+        keep.push_back(i);
+    }
+
+    int n = static_cast<int>(keep.size());
     ProcessedTrajectory traj;
     traj.duration = duration;
     traj.n_frames = n;
     traj.t.resize(n);
+    for (int m = 0; m < 4; ++m) traj.pos[m].resize(n);
+
     for (int i = 0; i < n; ++i) {
-        traj.t[i] = duration * i / (n - 1);
+        traj.t[i] = raw_t[keep[i]] - t_start;  // 归零
+        for (int m = 0; m < 4; ++m) {
+            traj.pos[m][i] = raw_pos[m][keep[i]];
+        }
     }
+
+    // ── 非均匀三次自然样条 (natural cubic spline) ──
+    // 直接在原始数据点上构建，充分利用每一帧
+    // S_i(x) = a_i + b_i*(x-x_i) + c_i*(x-x_i)^2 + d_i*(x-x_i)^3
 
     for (int m = 0; m < 4; ++m) {
-        traj.pos[m].resize(n);
-        // 线性插值重采样
-        int ri = 0;
-        for (int i = 0; i < n; ++i) {
-            double tt = traj.t[i] + raw_t.front();
-            while (ri + 1 < n_raw && raw_t[ri + 1] < tt) ++ri;
-            if (ri + 1 >= n_raw) {
-                traj.pos[m][i] = raw_pos[m].back();
-            } else {
-                double frac = (raw_t[ri + 1] > raw_t[ri])
-                    ? (tt - raw_t[ri]) / (raw_t[ri + 1] - raw_t[ri]) : 0.0;
-                traj.pos[m][i] = raw_pos[m][ri] + frac * (raw_pos[m][ri + 1] - raw_pos[m][ri]);
+        int ns = n - 1;  // 段数
+        auto& sp = traj.spline[m];
+        sp.a.resize(ns);
+        sp.b.resize(ns);
+        sp.c.resize(ns);
+        sp.d.resize(ns);
+
+        const auto& x = traj.t;
+        const auto& y = traj.pos[m];
+
+        // 计算各段间距 h[i] = x[i+1] - x[i]
+        std::vector<double> h(ns);
+        for (int i = 0; i < ns; ++i) {
+            h[i] = x[i + 1] - x[i];
+        }
+
+        // 构造三对角方程组求二阶导 c[] (natural: c[0] = c[n-1] = 0)
+        // 内部节点 i = 1..n-2:
+        // h[i-1]*c[i-1] + 2*(h[i-1]+h[i])*c[i] + h[i]*c[i+1]
+        //   = 3*((y[i+1]-y[i])/h[i] - (y[i]-y[i-1])/h[i-1])
+        std::vector<double> c_all(n, 0.0);  // c[0] = c[n-1] = 0
+
+        if (n > 2) {
+            int m_sz = n - 2;
+            // 三对角: sub=h[i-1], diag=2*(h[i-1]+h[i]), sup=h[i]
+            std::vector<double> sub(m_sz), diag(m_sz), sup(m_sz), rhs(m_sz);
+            for (int i = 0; i < m_sz; ++i) {
+                int k = i + 1;  // 原节点索引
+                sub[i] = h[k - 1];
+                diag[i] = 2.0 * (h[k - 1] + h[k]);
+                sup[i] = h[k];
+                rhs[i] = 3.0 * ((y[k + 1] - y[k]) / h[k] - (y[k] - y[k - 1]) / h[k - 1]);
             }
+
+            // Thomas 算法 (追赶法)
+            std::vector<double> cp(m_sz, 0.0);
+            std::vector<double> dp(m_sz, 0.0);
+
+            cp[0] = sup[0] / diag[0];
+            dp[0] = rhs[0] / diag[0];
+            for (int i = 1; i < m_sz; ++i) {
+                double w = diag[i] - sub[i] * cp[i - 1];
+                cp[i] = sup[i] / w;
+                dp[i] = (rhs[i] - sub[i] * dp[i - 1]) / w;
+            }
+
+            c_all[m_sz] = dp[m_sz - 1];
+            for (int i = m_sz - 2; i >= 0; --i) {
+                c_all[i + 1] = dp[i] - cp[i] * c_all[i + 2];
+            }
+        }
+
+        // 由 c 计算 a, b, d
+        for (int i = 0; i < ns; ++i) {
+            sp.a[i] = y[i];
+            sp.b[i] = (y[i + 1] - y[i]) / h[i] - h[i] * (2.0 * c_all[i] + c_all[i + 1]) / 3.0;
+            sp.c[i] = c_all[i];
+            sp.d[i] = (c_all[i + 1] - c_all[i]) / (3.0 * h[i]);
         }
     }
 
-    // SG 平滑 (简化: 三次多项式移动窗口最小二乘拟合, 取中心值)
-    int w = smooth_window;
-    if (w % 2 == 0) w++;
-    if (w > n) w = std::max(n / 2 * 2 - 1, 5);
-    int half = w / 2;
-
-    for (int m = 0; m < 4; ++m) {
-        std::vector<double> smoothed(n);
-        // 镜像填充
-        std::vector<double> padded(n + 2 * half);
-        for (int i = 0; i < half; ++i) {
-            padded[half - 1 - i] = 2.0 * traj.pos[m][0] - traj.pos[m][i + 1];
-        }
-        for (int i = 0; i < n; ++i) {
-            padded[half + i] = traj.pos[m][i];
-        }
-        for (int i = 0; i < half; ++i) {
-            padded[half + n + i] = 2.0 * traj.pos[m][n - 1] - traj.pos[m][n - 2 - i];
-        }
-
-        // SG: 3阶多项式, 窗口 w
-        // 对每个中心点, 用窗口内数据拟合 3 阶多项式, 取中心值
-        // 优化: 因为窗口滑动, SG 滤波器系数固定, 可预计算
-        // 但为简洁用矩阵法一次算系数向量
-        // c = (X^T X)^{-1} X^T 的第一行 (取 t=0 处的值)
-        std::vector<double> sg_coeffs(w);
-        {
-            // 构造 Vandermonde 矩阵 X[i][j] = x[i]^j, x = -half..half
-            // 3 阶多项式 → 4 列
-            int order = std::min(3, w - 2);
-            int cols = order + 1;
-            // 用正规方程解 SG 系数
-            // A = X^T X (cols × cols), b = X^T e_0 (cols × 1)
-            std::vector<std::vector<double>> A(cols, std::vector<double>(cols, 0.0));
-            std::vector<double> b_vec(cols, 0.0);
-            for (int i = 0; i < w; ++i) {
-                double x = i - half;
-                std::vector<double> xi(cols);
-                xi[0] = 1.0;
-                for (int j = 1; j < cols; ++j) xi[j] = xi[j - 1] * x;
-                for (int r = 0; r < cols; ++r) {
-                    for (int c = 0; c < cols; ++c) {
-                        A[r][c] += xi[r] * xi[c];
-                    }
-                    b_vec[r] += xi[r] * (i == half ? 1.0 : 0.0);
-                }
-            }
-            // 高斯消元求解 A * coeff = b_vec
-            for (int col = 0; col < cols; ++col) {
-                int pivot = col;
-                for (int row = col + 1; row < cols; ++row) {
-                    if (std::abs(A[row][col]) > std::abs(A[pivot][col])) pivot = row;
-                }
-                std::swap(A[col], A[pivot]);
-                std::swap(b_vec[col], b_vec[pivot]);
-                for (int row = col + 1; row < cols; ++row) {
-                    double factor = A[row][col] / A[col][col];
-                    for (int k = col; k < cols; ++k) A[row][k] -= factor * A[col][k];
-                    b_vec[row] -= factor * b_vec[col];
-                }
-            }
-            std::vector<double> coeff(cols);
-            for (int i = cols - 1; i >= 0; --i) {
-                coeff[i] = b_vec[i];
-                for (int j = i + 1; j < cols; ++j) coeff[i] -= A[i][j] * coeff[j];
-                coeff[i] /= A[i][i];
-            }
-            // SG 系数: h_i = sum_j coeff[j] * x_i^j
-            for (int i = 0; i < w; ++i) {
-                double x = i - half;
-                double val = 0.0, xp = 1.0;
-                for (int j = 0; j < cols; ++j) {
-                    val += coeff[j] * xp;
-                    xp *= x;
-                }
-                sg_coeffs[i] = val;
-            }
-        }
-
-        // 应用 SG 滤波
-        for (int i = 0; i < n; ++i) {
-            double val = 0.0;
-            for (int j = 0; j < w; ++j) {
-                val += sg_coeffs[j] * padded[i + j];
-            }
-            smoothed[i] = val;
-        }
-        traj.pos[m] = smoothed;
-    }
-
-    // 速度: 中心差分 + SG 平滑
-    double dt = (n > 1) ? traj.t[1] - traj.t[0] : 1.0 / rate_hz;
-    for (int m = 0; m < 4; ++m) {
-        traj.vel[m].resize(n);
-        // 中心差分
-        for (int i = 1; i < n - 1; ++i) {
-            traj.vel[m][i] = (traj.pos[m][i + 1] - traj.pos[m][i - 1]) / (2.0 * dt);
-        }
-        traj.vel[m][0] = (traj.pos[m][1] - traj.pos[m][0]) / dt;
-        traj.vel[m][n - 1] = (traj.pos[m][n - 1] - traj.pos[m][n - 2]) / dt;
-
-        // 对速度也做 SG 平滑 (复用 sg_coeffs, 镜像填充)
-        std::vector<double> padded_v(n + 2 * half);
-        for (int i = 0; i < half; ++i) {
-            padded_v[half - 1 - i] = 2.0 * traj.vel[m][0] - traj.vel[m][i + 1];
-        }
-        for (int i = 0; i < n; ++i) {
-            padded_v[half + i] = traj.vel[m][i];
-        }
-        for (int i = 0; i < half; ++i) {
-            padded_v[half + n + i] = 2.0 * traj.vel[m][n - 1] - traj.vel[m][n - 2 - i];
-        }
-        // 这里复用前面计算的 sg_coeffs 做速度平滑不方便（作用域问题）
-        // 直接用简单均值滤波
-        int vw = std::max(static_cast<int>(0.05 * rate_hz) / 2 * 2 + 1, 3);
-        int vhalf = vw / 2;
-        std::vector<double> v_smooth(n);
-        for (int i = 0; i < n; ++i) {
-            double sum = 0.0;
-            int cnt = 0;
-            for (int j = std::max(0, i - vhalf); j <= std::min(n - 1, i + vhalf); ++j) {
-                sum += traj.vel[m][j];
-                cnt++;
-            }
-            v_smooth[i] = sum / cnt;
-        }
-        traj.vel[m] = v_smooth;
-    }
-
-    RCLCPP_INFO(get_logger(), "轨迹处理: %d帧→%d帧 (%.2fs, SG窗口=%d)",
-                n_raw, n, duration, w);
+    RCLCPP_INFO(get_logger(), "轨迹处理: %d帧(去毛刺后%d点), %.2fs, 三次样条插值",
+                n_raw, n, duration);
     return traj;
 }
 
@@ -304,7 +240,7 @@ void TeachPlaybackControlNode::load_trajectory() {
         frames.push_back(f);
     }
 
-    traj_ = process_frames(frames, rate_hz_, smooth_window_, spike_thresh_);
+    traj_ = process_frames(frames, smooth_factor_, spike_thresh_);
 
     // 缓存起点/终点
     traj_.get_state(0.0, start_pos_, end_pos_);  // 临时存 end
@@ -347,25 +283,27 @@ bool TeachPlaybackControlNode::calibrate_zero() {
 
 TeachPlaybackControlNode::TeachPlaybackControlNode()
     : Node("teach_playback_control_node"),
-      state_(State::CALIBRATING),
+      state_(State::IDLE),
       trigger_pending_(false),
       phase_start_(0.0),
       playback_duration_(0.0)
 {
     // 声明参数
-    this->declare_parameter("teach_file", std::string("teach_data.json"));
+    this->declare_parameter("teach_file",
+        std::string(WORKSPACE_DIR "/teach_data.json"));
     this->declare_parameter("rec_index", -1);
     this->declare_parameter("kp", 1.0);
     this->declare_parameter("kd", 0.15);
-    this->declare_parameter("kp_hold", 1.0);
+    this->declare_parameter("kp_hold", 0.8);
     this->declare_parameter("kd_hold", 0.15);
     this->declare_parameter("speed", 1.0);
-    this->declare_parameter("smooth_window", 101);
+    this->declare_parameter("smooth_factor", 0.001);
     this->declare_parameter("spike_thresh", 20.0);
-    this->declare_parameter("tau_inner", 8.3);
-    this->declare_parameter("tau_outer", 2.0);
-    this->declare_parameter("goto_time", 2.0);
-    this->declare_parameter("return_time", 2.0);
+    this->declare_parameter("tau_inner", 3.1);
+    this->declare_parameter("tau_outer", 1.5);
+    this->declare_parameter("gravity_offset_inner", -M_PI / 2.0);
+    this->declare_parameter("gravity_offset_outer", -M_PI / 2.0);
+    this->declare_parameter("goto_time", 5.0);
     this->declare_parameter("hold_time", 1.0);
     this->declare_parameter("rate_hz", 200);
     this->declare_parameter("trigger_source", std::string("joy"));
@@ -379,12 +317,13 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
     kp_hold_ = this->get_parameter("kp_hold").as_double();
     kd_hold_ = this->get_parameter("kd_hold").as_double();
     speed_ = this->get_parameter("speed").as_double();
-    smooth_window_ = this->get_parameter("smooth_window").as_int();
+    smooth_factor_ = this->get_parameter("smooth_factor").as_double();
     spike_thresh_ = this->get_parameter("spike_thresh").as_double();
     tau_inner_ = this->get_parameter("tau_inner").as_double();
     tau_outer_ = this->get_parameter("tau_outer").as_double();
+    gravity_offset_inner_ = this->get_parameter("gravity_offset_inner").as_double();
+    gravity_offset_outer_ = this->get_parameter("gravity_offset_outer").as_double();
     goto_time_ = this->get_parameter("goto_time").as_double();
-    return_time_ = this->get_parameter("return_time").as_double();
     hold_time_ = this->get_parameter("hold_time").as_double();
     rate_hz_ = this->get_parameter("rate_hz").as_int();
     trigger_source_ = this->get_parameter("trigger_source").as_string();
@@ -485,9 +424,9 @@ double TeachPlaybackControlNode::smoothstep(double t) {
 
 double TeachPlaybackControlNode::gravity_torque(int mid, double theta1, double theta2) {
     if (is_inner(mid)) {
-        return tau_inner_ * std::cos(theta1) / GEAR_RATIO;
+        return tau_inner_ * std::cos(theta1 + gravity_offset_inner_) / GEAR_RATIO;
     } else {
-        return -tau_outer_ * std::cos(theta1 + theta2) / GEAR_RATIO;
+        return -tau_outer_ * std::cos(theta1 + theta2 + gravity_offset_outer_) / GEAR_RATIO;
     }
 }
 
@@ -527,15 +466,11 @@ static double now_sec() {
 }
 
 void TeachPlaybackControlNode::run() {
-    // Phase 0: 零位校准
-    RCLCPP_INFO(get_logger(), "========== Phase 0: 零位校准 ==========");
-    calibrate_zero();
-
     // 加载轨迹
     load_trajectory();
 
     state_ = State::IDLE;
-    RCLCPP_INFO(get_logger(), "进入 IDLE, 等待触发...");
+    RCLCPP_INFO(get_logger(), "进入 IDLE, 等待触发 (零位校准已跳过, 请手动校准)...");
 
     // 创建 executor 用于 spin
     rclcpp::executors::SingleThreadedExecutor executor;
@@ -588,7 +523,6 @@ void TeachPlaybackControlNode::run() {
 
             if (trigger_pending_) {
                 trigger_pending_ = false;
-                state_ = State::GOTO_START;
                 phase_start_ = now_sec();
                 for (int m = 0; m < 4; ++m) {
                     initial_pos_[m] = positions_.count(m) ? positions_[m] : 0.0;
@@ -598,7 +532,21 @@ void TeachPlaybackControlNode::run() {
                     msg.data = true;
                     state_pub_->publish(msg);
                 }
-                RCLCPP_INFO(get_logger(), "触发! → GOTO_START");
+
+                // 起点接近当前位置 → 跳过 GOTO_START 直接回放
+                double max_diff = 0.0;
+                for (int m = 0; m < 4; ++m) {
+                    max_diff = std::max(max_diff,
+                        std::abs(initial_pos_[m] - start_pos_[m]));
+                }
+                if (max_diff < 0.05) {  // < 3° 视为已在起点
+                    state_ = State::PLAYBACK;
+                    RCLCPP_INFO(get_logger(), "触发! 起点近零 → 直接 PLAYBACK");
+                } else {
+                    state_ = State::GOTO_START;
+                    RCLCPP_INFO(get_logger(), "触发! → GOTO_START (偏差 %.1f°)",
+                                max_diff * 180.0 / M_PI);
+                }
             }
         }
         // ── GOTO_START ──
@@ -651,27 +599,27 @@ void TeachPlaybackControlNode::run() {
             if (elapsed >= hold_time_) {
                 state_ = State::RETURN_ZERO;
                 phase_start_ = now_sec();
-                for (int m = 0; m < 4; ++m) {
-                    initial_pos_[m] = positions_.count(m) ? positions_[m] : 0.0;
-                }
-                RCLCPP_INFO(get_logger(), "保持结束 → RETURN");
+                RCLCPP_INFO(get_logger(), "保持结束 → RETURN (反向回放)");
             }
         }
-        // ── RETURN ──
+        // ── RETURN (反向回放录制轨迹) ──
         else if (state_ == State::RETURN_ZERO) {
             double elapsed = now_sec() - phase_start_;
-            double frac = (return_time_ > 0) ? smoothstep(elapsed / return_time_) : 1.0;
+            double t_reverse = traj_.duration - elapsed * speed_;
 
-            for (int mid : ALL_IDS) {
-                double p0 = initial_pos_[mid];
-                double p_des = p0 * (1.0 - frac);  // → 0
-                double tau_g = gravity_torque(mid, theta1, theta2);
-                send_cmd(mid, tau_g, kp_, kd_, p_des);
-            }
-
-            if (elapsed >= return_time_) {
+            if (t_reverse <= 0.0) {
+                // 倒放完成，已回到轨迹起点
                 state_ = State::IDLE;
-                RCLCPP_INFO(get_logger(), "回零完成 → IDLE, 等待下次触发");
+                RCLCPP_INFO(get_logger(), "倒放完成 → IDLE, 等待下次触发");
+            } else {
+                std::array<double, 4> pos_d, vel_d;
+                traj_.get_state(t_reverse, pos_d, vel_d);
+                for (int mid : ALL_IDS) {
+                    double tau_g = gravity_torque(mid, theta1, theta2);
+                    // 反向回放：位置正常，速度取反
+                    send_cmd(mid, tau_g, kp_, kd_,
+                             pos_d[mid], -vel_d[mid] * speed_);
+                }
             }
         }
 
@@ -711,9 +659,6 @@ void TeachPlaybackControlNode::run() {
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-
-    // 先零位校准（需要独立的 rclpy 调用，通过 system() 调用 Python 脚本）
-    // 注意: 校准会重启 motor_control_node，此时我们还没开始订阅
     auto node = std::make_shared<motor_control::TeachPlaybackControlNode>();
 
     try {

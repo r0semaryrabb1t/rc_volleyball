@@ -49,11 +49,12 @@ OUTER_IDS = {1, 3}  # 小臂
 
 
 class GravityHold:
-    def __init__(self, tau_inner, tau_outer, kd, ramp_time):
+    def __init__(self, tau_inner, tau_outer, kd, ramp_time, gravity_offset=-math.pi/2):
         self.tau_inner = tau_inner  # M0/M2 大臂输出端重力矩
         self.tau_outer = tau_outer  # M1/M3 小臂输出端重力矩
         self.kd = kd
         self.ramp_time = ramp_time
+        self.gravity_offset = gravity_offset
 
         rclpy.init()
         self.node = rclpy.create_node('gravity_hold')
@@ -109,12 +110,12 @@ class GravityHold:
         t = elapsed / self.ramp_time
         return t * t * (3.0 - 2.0 * t)  # smoothstep
 
-    def gravity_torque_rotor(self, motor_id, angle_rad, ramp):
+    def gravity_torque_rotor(self, motor_id, theta1, theta2, ramp):
         if motor_id in INNER_IDS:
-            return self.tau_inner * math.cos(angle_rad) / GEAR_RATIO * ramp
+            return self.tau_inner * math.cos(theta1 + self.gravity_offset) / GEAR_RATIO * ramp
         else:
-            # 小臂: 取反方向以正确抵抗重力下落
-            return -self.tau_outer * math.cos(angle_rad) / GEAR_RATIO * ramp
+            # 小臂: 用绝对角度 θ₁+θ₂
+            return -self.tau_outer * math.cos(theta1 + theta2 + self.gravity_offset) / GEAR_RATIO * ramp
 
     def check_node_alive(self):
         now = time.time()
@@ -223,11 +224,13 @@ class GravityHold:
                 rclpy.spin_once(self.node, timeout_sec=0)
 
             ramp = self.ramp_factor(elapsed)
+            theta1 = (self.positions.get(0, 0.0) + self.positions.get(2, 0.0)) / 2.0
+            theta2 = (self.positions.get(1, 0.0) + self.positions.get(3, 0.0)) / 2.0
             snapshot = {}
             for mid in ALL_IDS:
                 pos = self.positions.get(mid, 0.0)
                 vel = self.velocities.get(mid, 0.0)
-                tau_ff = self.gravity_torque_rotor(mid, pos, ramp)
+                tau_ff = self.gravity_torque_rotor(mid, theta1, theta2, ramp)
                 self._send_cmd(mid, tau_ff, self.kd)
                 snapshot[mid] = (pos, vel, tau_ff)
 
@@ -281,13 +284,16 @@ def main():
                         help='M0/M2 大臂输出端重力矩 Nm（默认 6.0）')
     parser.add_argument('--tau-outer', type=float, default=0.5,
                         help='M1/M3 小臂输出端重力矩 Nm（默认 2.0）')
+    parser.add_argument('--gravity-offset', type=float, default=-1.5708,
+                        help='零位到水平的角度偏移 rad (默认 -π/2, 零位=下垂)')
     parser.add_argument('--kd', type=float, default=0.02,
                         help='转子侧阻尼系数（默认 0.02，手册推荐）')
     parser.add_argument('--ramp', type=float, default=1,
                         help='力矩斜坡时间 s（默认 1.5）')
     args = parser.parse_args()
 
-    holder = GravityHold(args.tau_inner, args.tau_outer, args.kd, args.ramp)
+    holder = GravityHold(args.tau_inner, args.tau_outer, args.kd, args.ramp,
+                          args.gravity_offset)
     holder.run()
 
 

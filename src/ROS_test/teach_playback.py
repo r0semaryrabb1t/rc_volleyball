@@ -207,6 +207,7 @@ class TeachPlayback:
         # tau 优先使用 JSON 中录制时保存的值，保证录制/回放一致
         self.tau_inner = data.get('tau_inner', args.tau_inner)
         self.tau_outer = data.get('tau_outer', args.tau_outer)
+        self.gravity_offset = args.gravity_offset
         print(f"[INFO] 重力补偿来自示教文件: 大臂={self.tau_inner}Nm 小臂={self.tau_outer}Nm")
 
         self.traj = TrajectoryProcessor(
@@ -269,9 +270,9 @@ class TeachPlayback:
     def gravity_torque_rotor(self, mid, theta1, theta2, ramp=1.0):
         """重力补偿力矩 (转子侧)"""
         if mid in INNER_IDS:
-            tau = self.tau_inner * math.cos(theta1) / GEAR_RATIO * ramp
+            tau = self.tau_inner * math.cos(theta1 + self.gravity_offset) / GEAR_RATIO * ramp
         else:
-            tau = -self.tau_outer * math.cos(theta1 + theta2) / GEAR_RATIO * ramp
+            tau = -self.tau_outer * math.cos(theta1 + theta2 + self.gravity_offset) / GEAR_RATIO * ramp
         return tau
 
     def check_node_alive(self):
@@ -482,10 +483,12 @@ def main():
     parser.add_argument('--spike-thresh', type=float, default=20.0,
                         help='毛刺检测速度阈值 rad/s (默认 20.0)')
 
-    parser.add_argument('--tau-inner', type=float, default=8.3,
-                        help='大臂重力矩 Nm (默认 8.3)')
-    parser.add_argument('--tau-outer', type=float, default=2.0,
-                        help='小臂重力矩 Nm (默认 2.0)')
+    parser.add_argument('--tau-inner', type=float, default=3.1,
+                        help='大臂重力矩 Nm (默认 3.1)')
+    parser.add_argument('--tau-outer', type=float, default=1.5,
+                        help='小臂重力矩 Nm (默认 1.5)')
+    parser.add_argument('--gravity-offset', type=float, default=-1.5708,
+                        help='零位到水平的角度偏移 rad (默认 -π/2, 零位=下垂)')
     parser.add_argument('--ramp', type=float, default=0.0,
                         help='重力补偿斜坡时间 s (默认 0, 跳过)')
     parser.add_argument('--goto-time', type=float, default=0.0,
