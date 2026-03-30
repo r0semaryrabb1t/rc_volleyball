@@ -1,12 +1,10 @@
 #include "motor_control_ros2/teach_playback_control_node.hpp"
 
 #include <nlohmann/json.hpp>
-#include <rclcpp/executors.hpp>
 #include <fstream>
 #include <algorithm>
 #include <numeric>
 #include <chrono>
-#include <thread>
 #include <cstdlib>
 
 using json = nlohmann::json;
@@ -26,22 +24,20 @@ void ProcessedTrajectory::get_state(
 {
     time = std::clamp(time, 0.0, duration);
 
-    // 二分搜索找到 time 所在区间 [t[idx-1], t[idx])
+    // 二分搜索找到 time 所在区间
     auto it = std::lower_bound(t.begin(), t.end(), time);
     int idx = static_cast<int>(std::distance(t.begin(), it));
-    // 映射到段索引 i, 使得 t[i] <= time < t[i+1]
     int seg = idx - 1;
     if (seg < 0) seg = 0;
     if (seg >= n_frames - 1) seg = n_frames - 2;
 
-    double dx = time - t[seg];
+    double dt = t[seg + 1] - t[seg];
+    double frac = (dt > 0.0) ? (time - t[seg]) / dt : 0.0;
+    frac = std::clamp(frac, 0.0, 1.0);
 
     for (int m = 0; m < 4; ++m) {
-        const auto& s = spline[m];
-        // S(x) = a + b*dx + c*dx^2 + d*dx^3
-        out_pos[m] = s.a[seg] + dx * (s.b[seg] + dx * (s.c[seg] + dx * s.d[seg]));
-        // S'(x) = b + 2*c*dx + 3*d*dx^2
-        out_vel[m] = s.b[seg] + dx * (2.0 * s.c[seg] + 3.0 * s.d[seg] * dx);
+        out_pos[m] = pos[m][seg] + frac * (pos[m][seg + 1] - pos[m][seg]);
+        out_vel[m] = vel[m][seg] + frac * (vel[m][seg + 1] - vel[m][seg]);
     }
 }
 
@@ -49,7 +45,7 @@ void ProcessedTrajectory::get_state(
 
 ProcessedTrajectory TeachPlaybackControlNode::process_frames(
     const std::vector<TeachFrame>& frames,
-    int /* rate_hz */, int /* smooth_window */, double spike_thresh)
+    double filter_tau, double spike_thresh)
 {
     int n_raw = static_cast<int>(frames.size());
     std::vector<double> raw_t(n_raw);
@@ -119,74 +115,49 @@ ProcessedTrajectory TeachPlaybackControlNode::process_frames(
         }
     }
 
-    // ── 非均匀三次自然样条 (natural cubic spline) ──
-    // 直接在原始数据点上构建，充分利用每一帧
-    // S_i(x) = a_i + b_i*(x-x_i) + c_i*(x-x_i)^2 + d_i*(x-x_i)^3
-
-    for (int m = 0; m < 4; ++m) {
-        int ns = n - 1;  // 段数
-        auto& sp = traj.spline[m];
-        sp.a.resize(ns);
-        sp.b.resize(ns);
-        sp.c.resize(ns);
-        sp.d.resize(ns);
-
-        const auto& x = traj.t;
-        const auto& y = traj.pos[m];
-
-        // 计算各段间距 h[i] = x[i+1] - x[i]
-        std::vector<double> h(ns);
-        for (int i = 0; i < ns; ++i) {
-            h[i] = x[i + 1] - x[i];
-        }
-
-        // 构造三对角方程组求二阶导 c[] (natural: c[0] = c[n-1] = 0)
-        // 内部节点 i = 1..n-2:
-        // h[i-1]*c[i-1] + 2*(h[i-1]+h[i])*c[i] + h[i]*c[i+1]
-        //   = 3*((y[i+1]-y[i])/h[i] - (y[i]-y[i-1])/h[i-1])
-        std::vector<double> c_all(n, 0.0);  // c[0] = c[n-1] = 0
-
-        if (n > 2) {
-            int m_sz = n - 2;
-            // 三对角: sub=h[i-1], diag=2*(h[i-1]+h[i]), sup=h[i]
-            std::vector<double> sub(m_sz), diag(m_sz), sup(m_sz), rhs(m_sz);
-            for (int i = 0; i < m_sz; ++i) {
-                int k = i + 1;  // 原节点索引
-                sub[i] = h[k - 1];
-                diag[i] = 2.0 * (h[k - 1] + h[k]);
-                sup[i] = h[k];
-                rhs[i] = 3.0 * ((y[k + 1] - y[k]) / h[k] - (y[k] - y[k - 1]) / h[k - 1]);
+    // ── 一阶低通滤波 (前向-后向，零相移) ──────────────────────
+    // filter_tau: 滤波时间常数 (秒)。越大越平滑。0 = 不滤波。
+    if (filter_tau > 0.0 && n > 2) {
+        for (int m = 0; m < 4; ++m) {
+            std::vector<double>& y = traj.pos[m];
+            // 前向滤波
+            std::vector<double> fwd(n);
+            fwd[0] = y[0];
+            for (int i = 1; i < n; ++i) {
+                double dt = traj.t[i] - traj.t[i - 1];
+                double alpha = dt / (filter_tau + dt);
+                fwd[i] = fwd[i - 1] + alpha * (y[i] - fwd[i - 1]);
             }
-
-            // Thomas 算法 (追赶法)
-            std::vector<double> cp(m_sz, 0.0);
-            std::vector<double> dp(m_sz, 0.0);
-
-            cp[0] = sup[0] / diag[0];
-            dp[0] = rhs[0] / diag[0];
-            for (int i = 1; i < m_sz; ++i) {
-                double w = diag[i] - sub[i] * cp[i - 1];
-                cp[i] = sup[i] / w;
-                dp[i] = (rhs[i] - sub[i] * dp[i - 1]) / w;
+            // 后向滤波
+            std::vector<double> bwd(n);
+            bwd[n - 1] = fwd[n - 1];
+            for (int i = n - 2; i >= 0; --i) {
+                double dt = traj.t[i + 1] - traj.t[i];
+                double alpha = dt / (filter_tau + dt);
+                bwd[i] = bwd[i + 1] + alpha * (fwd[i] - bwd[i + 1]);
             }
-
-            c_all[m_sz] = dp[m_sz - 1];
-            for (int i = m_sz - 2; i >= 0; --i) {
-                c_all[i + 1] = dp[i] - cp[i] * c_all[i + 2];
-            }
-        }
-
-        // 由 c 计算 a, b, d
-        for (int i = 0; i < ns; ++i) {
-            sp.a[i] = y[i];
-            sp.b[i] = (y[i + 1] - y[i]) / h[i] - h[i] * (2.0 * c_all[i] + c_all[i + 1]) / 3.0;
-            sp.c[i] = c_all[i];
-            sp.d[i] = (c_all[i + 1] - c_all[i]) / (3.0 * h[i]);
+            y = bwd;
         }
     }
 
-    RCLCPP_INFO(get_logger(), "轨迹处理: %d帧(去毛刺后%d点), %.2fs, 三次样条插值",
-                n_raw, n, duration);
+    // ── 中心差分计算速度（用于前馈）──────────────────────────────
+    for (int m = 0; m < 4; ++m) {
+        traj.vel[m].resize(n, 0.0);
+        const auto& y = traj.pos[m];
+        for (int i = 1; i < n - 1; ++i) {
+            double dt2 = traj.t[i + 1] - traj.t[i - 1];
+            traj.vel[m][i] = (dt2 > 0.0) ? (y[i + 1] - y[i - 1]) / dt2 : 0.0;
+        }
+        if (n >= 2) {
+            double dt0 = traj.t[1] - traj.t[0];
+            traj.vel[m][0] = (dt0 > 0.0) ? (y[1] - y[0]) / dt0 : 0.0;
+            double dtn = traj.t[n - 1] - traj.t[n - 2];
+            traj.vel[m][n - 1] = (dtn > 0.0) ? (y[n - 1] - y[n - 2]) / dtn : 0.0;
+        }
+    }
+
+    RCLCPP_INFO(get_logger(), "轨迹处理: %d帧(去毛刺后%d点), %.2fs, 低通滤波(τ=%.3fs)",
+                n_raw, n, duration, filter_tau);
     return traj;
 }
 
@@ -240,7 +211,7 @@ void TeachPlaybackControlNode::load_trajectory() {
         frames.push_back(f);
     }
 
-    traj_ = process_frames(frames, smooth_factor_, spike_thresh_);
+    traj_ = process_frames(frames, filter_tau_, spike_thresh_);
 
     // 缓存起点/终点
     traj_.get_state(0.0, start_pos_, end_pos_);  // 临时存 end
@@ -292,22 +263,23 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
     this->declare_parameter("teach_file",
         std::string(WORKSPACE_DIR "/teach_data.json"));
     this->declare_parameter("rec_index", -1);
-    this->declare_parameter("kp", 1.0);
+    this->declare_parameter("kp", 0.05);
     this->declare_parameter("kd", 0.15);
-    this->declare_parameter("kp_hold", 0.8);
-    this->declare_parameter("kd_hold", 0.15);
-    this->declare_parameter("speed", 1.0);
-    this->declare_parameter("smooth_factor", 0.001);
+    this->declare_parameter("kp_hold", 0.3);
+    this->declare_parameter("kd_hold", 0.05);
+    this->declare_parameter("speed", 1.5);
+    this->declare_parameter("filter_tau", 0.02);
     this->declare_parameter("spike_thresh", 20.0);
     this->declare_parameter("tau_inner", 3.1);
     this->declare_parameter("tau_outer", 1.5);
     this->declare_parameter("gravity_offset_inner", -M_PI / 2.0);
     this->declare_parameter("gravity_offset_outer", -M_PI / 2.0);
     this->declare_parameter("goto_time", 5.0);
-    this->declare_parameter("hold_time", 1.0);
+    this->declare_parameter("hold_time", 0.5);
     this->declare_parameter("rate_hz", 200);
     this->declare_parameter("trigger_source", std::string("joy"));
     this->declare_parameter("joy_button", 5);
+    this->declare_parameter("sym_diff_limit", 15.0);  // 对称角度差阈值(度)
 
     // 读取参数
     teach_file_ = this->get_parameter("teach_file").as_string();
@@ -317,7 +289,7 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
     kp_hold_ = this->get_parameter("kp_hold").as_double();
     kd_hold_ = this->get_parameter("kd_hold").as_double();
     speed_ = this->get_parameter("speed").as_double();
-    smooth_factor_ = this->get_parameter("smooth_factor").as_double();
+    filter_tau_ = this->get_parameter("filter_tau").as_double();
     spike_thresh_ = this->get_parameter("spike_thresh").as_double();
     tau_inner_ = this->get_parameter("tau_inner").as_double();
     tau_outer_ = this->get_parameter("tau_outer").as_double();
@@ -328,6 +300,7 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
     rate_hz_ = this->get_parameter("rate_hz").as_int();
     trigger_source_ = this->get_parameter("trigger_source").as_string();
     joy_button_ = this->get_parameter("joy_button").as_int();
+    sym_diff_limit_ = this->get_parameter("sym_diff_limit").as_double();
 
     initial_pos_.fill(0.0);
     start_pos_.fill(0.0);
@@ -339,7 +312,8 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
     state_pub_ = this->create_publisher<std_msgs::msg::Bool>(
         "/strike_busy", 10);
     motor_sub_ = this->create_subscription<motor_control_ros2::msg::UnitreeGO8010State>(
-        "/unitree_go8010_states", 10,
+        "/unitree_go8010_states",
+        rclcpp::QoS(10),
         std::bind(&TeachPlaybackControlNode::state_callback, this, std::placeholders::_1));
 
     if (trigger_source_ == "joy") {
@@ -362,6 +336,10 @@ TeachPlaybackControlNode::TeachPlaybackControlNode()
 void TeachPlaybackControlNode::state_callback(
     const motor_control_ros2::msg::UnitreeGO8010State::SharedPtr msg)
 {
+    // 只接受击球臂电机，忽略其他节点（如 delta_arm_manager）的数据
+    if (msg->joint_name.find("strike_motor") == std::string::npos) {
+        return;
+    }
     positions_[msg->motor_id] = msg->position;
     velocities_[msg->motor_id] = msg->velocity;
     temperatures_[msg->motor_id] = msg->temperature;
@@ -374,11 +352,14 @@ void TeachPlaybackControlNode::state_callback(
 void TeachPlaybackControlNode::joy_callback(
     const sensor_msgs::msg::Joy::SharedPtr msg)
 {
-    if (state_ == State::IDLE &&
-        static_cast<int>(msg->buttons.size()) > joy_button_ &&
+    if (static_cast<int>(msg->buttons.size()) > joy_button_ &&
         msg->buttons[joy_button_]) {
-        trigger_pending_ = true;
-        RCLCPP_INFO(get_logger(), "收到手柄触发信号");
+        if (state_ == State::IDLE) {
+            trigger_pending_ = true;
+            RCLCPP_INFO(get_logger(), "收到手柄触发信号 → 触发!");
+        } else {
+            RCLCPP_WARN(get_logger(), "收到 RB 按下, 但当前状态非 IDLE, 忽略");
+        }
     }
 }
 
@@ -451,6 +432,42 @@ bool TeachPlaybackControlNode::check_safety() {
             return false;
         }
     }
+
+    // 对称电机角度差检测 (仅在非 IDLE 状态检查)
+    if (state_ != State::IDLE) {
+        double max_diff_rad = sym_diff_limit_ * M_PI / 180.0;
+        double t_now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto p0 = positions_.find(0), p2 = positions_.find(2);
+        if (p0 != positions_.end() && p2 != positions_.end()) {
+            double diff = std::abs(p0->second - p2->second);
+            if (diff > max_diff_rad) {
+                RCLCPP_ERROR(get_logger(),
+                    "大臂不对称! M0=%.1f°(%.3fs前) M2=%.1f°(%.3fs前) 差=%.1f° > %.0f°",
+                    p0->second * 180.0 / M_PI,
+                    t_now - (last_update_.count(0) ? last_update_[0] : 0.0),
+                    p2->second * 180.0 / M_PI,
+                    t_now - (last_update_.count(2) ? last_update_[2] : 0.0),
+                    diff * 180.0 / M_PI, sym_diff_limit_);
+                return false;
+            }
+        }
+        auto p1 = positions_.find(1), p3 = positions_.find(3);
+        if (p1 != positions_.end() && p3 != positions_.end()) {
+            double diff = std::abs(p1->second - p3->second);
+            if (diff > max_diff_rad) {
+                RCLCPP_ERROR(get_logger(),
+                    "小臂不对称! M1=%.1f°(%.3fs前) M3=%.1f°(%.3fs前) 差=%.1f° > %.0f°",
+                    p1->second * 180.0 / M_PI,
+                    t_now - (last_update_.count(1) ? last_update_[1] : 0.0),
+                    p3->second * 180.0 / M_PI,
+                    t_now - (last_update_.count(3) ? last_update_[3] : 0.0),
+                    diff * 180.0 / M_PI, sym_diff_limit_);
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -465,192 +482,175 @@ static double now_sec() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void TeachPlaybackControlNode::run() {
+void TeachPlaybackControlNode::start() {
     // 加载轨迹
     load_trajectory();
 
     state_ = State::IDLE;
+    loop_count_ = 0;
     RCLCPP_INFO(get_logger(), "进入 IDLE, 等待触发 (零位校准已跳过, 请手动校准)...");
 
-    // 创建 executor 用于 spin
-    rclcpp::executors::SingleThreadedExecutor executor;
-    executor.add_node(this->shared_from_this());
-
+    // 创建 wall_timer，由 executor 统一调度回调和订阅
     double dt = 1.0 / rate_hz_;
-    int loop_count = 0;
+    control_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(dt),
+        std::bind(&TeachPlaybackControlNode::control_loop, this));
+}
 
-    while (rclcpp::ok()) {
-        double t_now = now_sec();
+void TeachPlaybackControlNode::control_loop() {
+    if (!motors_online()) {
+        if (loop_count_ % rate_hz_ == 0) {
+            RCLCPP_WARN(get_logger(), "等待电机上线...");
+        }
+        loop_count_++;
+        return;
+    }
 
-        // 排空消息队列
-        executor.spin_some(std::chrono::milliseconds(0));
+    // 安全检查 (每帧，200Hz)
+    if (!check_safety()) {
+        brake_all();
+        if (state_ != State::IDLE) {
+            RCLCPP_ERROR(get_logger(), "安全检查失败, 刹车!");
+        }
+        state_ = State::IDLE;
+    }
 
-        if (!motors_online()) {
-            if (loop_count % rate_hz_ == 0) {
-                RCLCPP_WARN(get_logger(), "等待电机上线...");
-            }
-            loop_count++;
-            std::this_thread::sleep_for(
-                std::chrono::duration<double>(dt));
-            continue;
+    auto [theta1, theta2] = get_theta_pair();
+
+    // ── IDLE ──
+    if (state_ == State::IDLE) {
+        {
+            auto msg = std_msgs::msg::Bool();
+            msg.data = false;
+            state_pub_->publish(msg);
         }
 
-        // 安全检查 (每秒)
-        if (loop_count % rate_hz_ == 0 && loop_count > 0) {
-            if (!check_safety()) {
-                brake_all();
-                state_ = State::IDLE;
-                RCLCPP_ERROR(get_logger(), "安全检查失败, 刹车!");
-                std::this_thread::sleep_for(1s);
-                continue;
-            }
+        for (int mid : ALL_IDS) {
+            double tau_g = gravity_torque(mid, theta1, theta2);
+            send_cmd(mid, tau_g, kp_hold_, kd_hold_, 0.0);
         }
 
-        auto [theta1, theta2] = get_theta_pair();
-
-        // ── IDLE ──
-        if (state_ == State::IDLE) {
+        if (trigger_pending_) {
+            trigger_pending_ = false;
+            phase_start_ = now_sec();
+            for (int m = 0; m < 4; ++m) {
+                initial_pos_[m] = positions_.count(m) ? positions_[m] : 0.0;
+            }
             {
                 auto msg = std_msgs::msg::Bool();
-                msg.data = false;
+                msg.data = true;
                 state_pub_->publish(msg);
             }
 
-            for (int mid : ALL_IDS) {
-                double tau_g = gravity_torque(mid, theta1, theta2);
-                send_cmd(mid, tau_g, kp_hold_, kd_hold_, 0.0);
+            // 起点接近当前位置 → 跳过 GOTO_START 直接回放
+            double max_diff = 0.0;
+            for (int m = 0; m < 4; ++m) {
+                max_diff = std::max(max_diff,
+                    std::abs(initial_pos_[m] - start_pos_[m]));
             }
-
-            if (trigger_pending_) {
-                trigger_pending_ = false;
-                phase_start_ = now_sec();
-                for (int m = 0; m < 4; ++m) {
-                    initial_pos_[m] = positions_.count(m) ? positions_[m] : 0.0;
-                }
-                {
-                    auto msg = std_msgs::msg::Bool();
-                    msg.data = true;
-                    state_pub_->publish(msg);
-                }
-
-                // 起点接近当前位置 → 跳过 GOTO_START 直接回放
-                double max_diff = 0.0;
-                for (int m = 0; m < 4; ++m) {
-                    max_diff = std::max(max_diff,
-                        std::abs(initial_pos_[m] - start_pos_[m]));
-                }
-                if (max_diff < 0.05) {  // < 3° 视为已在起点
-                    state_ = State::PLAYBACK;
-                    RCLCPP_INFO(get_logger(), "触发! 起点近零 → 直接 PLAYBACK");
-                } else {
-                    state_ = State::GOTO_START;
-                    RCLCPP_INFO(get_logger(), "触发! → GOTO_START (偏差 %.1f°)",
-                                max_diff * 180.0 / M_PI);
-                }
-            }
-        }
-        // ── GOTO_START ──
-        else if (state_ == State::GOTO_START) {
-            double elapsed = now_sec() - phase_start_;
-            double frac = (goto_time_ > 0) ? smoothstep(elapsed / goto_time_) : 1.0;
-
-            for (int mid : ALL_IDS) {
-                double p0 = initial_pos_[mid];
-                double pf = start_pos_[mid];
-                double p_des = p0 + (pf - p0) * frac;
-                double tau_g = gravity_torque(mid, theta1, theta2);
-                send_cmd(mid, tau_g, kp_, kd_, p_des);
-            }
-
-            if (elapsed >= goto_time_) {
+            if (max_diff < 0.05) {  // < 3° 视为已在起点
                 state_ = State::PLAYBACK;
-                phase_start_ = now_sec();
-                RCLCPP_INFO(get_logger(), "到达起点 → PLAYBACK");
-            }
-        }
-        // ── PLAYBACK ──
-        else if (state_ == State::PLAYBACK) {
-            double elapsed = now_sec() - phase_start_;
-            double t_traj = elapsed * speed_;
-
-            if (t_traj >= traj_.duration) {
-                state_ = State::HOLD;
-                phase_start_ = now_sec();
-                RCLCPP_INFO(get_logger(), "回放完成 → HOLD");
+                RCLCPP_INFO(get_logger(), "触发! 起点近零 → 直接 PLAYBACK");
             } else {
-                std::array<double, 4> pos_d, vel_d;
-                traj_.get_state(t_traj, pos_d, vel_d);
-                for (int mid : ALL_IDS) {
-                    double tau_g = gravity_torque(mid, theta1, theta2);
-                    send_cmd(mid, tau_g, kp_, kd_,
-                             pos_d[mid], vel_d[mid] * speed_);
-                }
+                state_ = State::GOTO_START;
+                RCLCPP_INFO(get_logger(), "触发! → GOTO_START (偏差 %.1f°)",
+                            max_diff * 180.0 / M_PI);
             }
         }
-        // ── HOLD ──
-        else if (state_ == State::HOLD) {
-            double elapsed = now_sec() - phase_start_;
+    }
+    // ── GOTO_START ──
+    else if (state_ == State::GOTO_START) {
+        double elapsed = now_sec() - phase_start_;
+        double frac = (goto_time_ > 0) ? smoothstep(elapsed / goto_time_) : 1.0;
 
+        for (int mid : ALL_IDS) {
+            double p0 = initial_pos_[mid];
+            double pf = start_pos_[mid];
+            double p_des = p0 + (pf - p0) * frac;
+            double tau_g = gravity_torque(mid, theta1, theta2);
+            send_cmd(mid, tau_g, kp_, kd_, p_des);
+        }
+
+        if (elapsed >= goto_time_) {
+            state_ = State::PLAYBACK;
+            phase_start_ = now_sec();
+            RCLCPP_INFO(get_logger(), "到达起点 → PLAYBACK");
+        }
+    }
+    // ── PLAYBACK ──
+    else if (state_ == State::PLAYBACK) {
+        double elapsed = now_sec() - phase_start_;
+        double t_traj = elapsed * speed_;
+
+        if (t_traj >= traj_.duration) {
+            state_ = State::HOLD;
+            phase_start_ = now_sec();
+            RCLCPP_INFO(get_logger(), "回放完成 → HOLD");
+        } else {
+            std::array<double, 4> pos_d, vel_d;
+            traj_.get_state(t_traj, pos_d, vel_d);
             for (int mid : ALL_IDS) {
                 double tau_g = gravity_torque(mid, theta1, theta2);
-                send_cmd(mid, tau_g, kp_hold_, kd_hold_, end_pos_[mid]);
-            }
-
-            if (elapsed >= hold_time_) {
-                state_ = State::RETURN_ZERO;
-                phase_start_ = now_sec();
-                RCLCPP_INFO(get_logger(), "保持结束 → RETURN (反向回放)");
+                send_cmd(mid, tau_g, kp_, kd_,
+                         pos_d[mid], vel_d[mid] * speed_);
             }
         }
-        // ── RETURN (反向回放录制轨迹) ──
-        else if (state_ == State::RETURN_ZERO) {
-            double elapsed = now_sec() - phase_start_;
-            double t_reverse = traj_.duration - elapsed * speed_;
+    }
+    // ── HOLD ──
+    else if (state_ == State::HOLD) {
+        double elapsed = now_sec() - phase_start_;
 
-            if (t_reverse <= 0.0) {
-                // 倒放完成，已回到轨迹起点
-                state_ = State::IDLE;
-                RCLCPP_INFO(get_logger(), "倒放完成 → IDLE, 等待下次触发");
-            } else {
-                std::array<double, 4> pos_d, vel_d;
-                traj_.get_state(t_reverse, pos_d, vel_d);
-                for (int mid : ALL_IDS) {
-                    double tau_g = gravity_torque(mid, theta1, theta2);
-                    // 反向回放：位置正常，速度取反
-                    send_cmd(mid, tau_g, kp_, kd_,
-                             pos_d[mid], -vel_d[mid] * speed_);
-                }
-            }
+        for (int mid : ALL_IDS) {
+            double tau_g = gravity_torque(mid, theta1, theta2);
+            send_cmd(mid, tau_g, kp_hold_, kd_hold_, end_pos_[mid]);
         }
 
-        // 状态汇报 (每 2 秒)
-        loop_count++;
-        if (loop_count % (rate_hz_ * 2) == 0) {
-            const char* state_str = "?";
-            switch (state_) {
-                case State::CALIBRATING: state_str = "CALIBRATING"; break;
-                case State::IDLE:        state_str = "IDLE"; break;
-                case State::GOTO_START:  state_str = "GOTO_START"; break;
-                case State::PLAYBACK:    state_str = "PLAYBACK"; break;
-                case State::HOLD:        state_str = "HOLD"; break;
-                case State::RETURN_ZERO: state_str = "RETURN"; break;
-            }
-            RCLCPP_INFO(get_logger(), "[%s] M0:%+.1f° M1:%+.1f° M2:%+.1f° M3:%+.1f°",
-                        state_str,
-                        positions_.count(0) ? positions_[0] * 180.0 / M_PI : 0.0,
-                        positions_.count(1) ? positions_[1] * 180.0 / M_PI : 0.0,
-                        positions_.count(2) ? positions_[2] * 180.0 / M_PI : 0.0,
-                        positions_.count(3) ? positions_[3] * 180.0 / M_PI : 0.0);
+        if (elapsed >= hold_time_) {
+            state_ = State::RETURN_ZERO;
+            phase_start_ = now_sec();
+            RCLCPP_INFO(get_logger(), "保持结束 → RETURN (反向回放)");
         }
+    }
+    // ── RETURN (反向回放录制轨迹) ──
+    else if (state_ == State::RETURN_ZERO) {
+        double elapsed = now_sec() - phase_start_;
+        double t_reverse = traj_.duration - elapsed * speed_;
 
-        double sleep_time = dt - (now_sec() - t_now);
-        if (sleep_time > 0) {
-            std::this_thread::sleep_for(
-                std::chrono::duration<double>(sleep_time));
+        if (t_reverse <= 0.0) {
+            // 倒放完成，已回到轨迹起点
+            state_ = State::IDLE;
+            RCLCPP_INFO(get_logger(), "倒放完成 → IDLE, 等待下次触发");
+        } else {
+            std::array<double, 4> pos_d, vel_d;
+            traj_.get_state(t_reverse, pos_d, vel_d);
+            for (int mid : ALL_IDS) {
+                double tau_g = gravity_torque(mid, theta1, theta2);
+                // 反向回放：位置正常，速度取反
+                send_cmd(mid, tau_g, kp_, kd_,
+                         pos_d[mid], -vel_d[mid] * speed_);
+            }
         }
     }
 
-    brake_all();
+    // 状态汇报 (每 2 秒)
+    loop_count_++;
+    if (loop_count_ % (rate_hz_ * 2) == 0) {
+        const char* state_str = "?";
+        switch (state_) {
+            case State::CALIBRATING: state_str = "CALIBRATING"; break;
+            case State::IDLE:        state_str = "IDLE"; break;
+            case State::GOTO_START:  state_str = "GOTO_START"; break;
+            case State::PLAYBACK:    state_str = "PLAYBACK"; break;
+            case State::HOLD:        state_str = "HOLD"; break;
+            case State::RETURN_ZERO: state_str = "RETURN"; break;
+        }
+        RCLCPP_INFO(get_logger(), "[%s] M0:%+.1f° M1:%+.1f° M2:%+.1f° M3:%+.1f°",
+                    state_str,
+                    positions_.count(0) ? positions_[0] * 180.0 / M_PI : 0.0,
+                    positions_.count(1) ? positions_[1] * 180.0 / M_PI : 0.0,
+                    positions_.count(2) ? positions_[2] * 180.0 / M_PI : 0.0,
+                    positions_.count(3) ? positions_[3] * 180.0 / M_PI : 0.0);
+    }
 }
 
 }  // namespace motor_control
@@ -662,7 +662,8 @@ int main(int argc, char* argv[]) {
     auto node = std::make_shared<motor_control::TeachPlaybackControlNode>();
 
     try {
-        node->run();
+        node->start();          // 非阻塞：加载轨迹 + 启动 200Hz timer
+        rclcpp::spin(node);     // executor 统一调度订阅回调和控制 timer
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node->get_logger(), "异常退出: %s", e.what());
     }

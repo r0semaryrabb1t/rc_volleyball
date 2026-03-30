@@ -9,8 +9,8 @@
   4. Ctrl+C 停止录制，自动保存 JSON 文件
 
 参数:
-  --tau-inner   大臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 8.3)
-  --tau-outer   小臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 2.0)
+  --tau-inner   大臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 3.1)
+  --tau-outer   小臂重力矩 Nm (默认 0, 无补偿; 需要补偿时手动指定如 1.5)
   --kd          转子侧阻尼 (默认 0.005)
   --ramp        斜坡时间 s (默认 1.5)
   --rate        采样频率 Hz (默认 200)
@@ -37,6 +37,7 @@ class TeachRecorder:
     def __init__(self, args):
         self.tau_inner = args.tau_inner
         self.tau_outer = args.tau_outer
+        self.gravity_offset = args.gravity_offset
         self.kd = args.kd
         self.ramp_time = args.ramp
         self.rate_hz = args.rate
@@ -75,7 +76,7 @@ class TeachRecorder:
         for mid in ALL_IDS:
             pos = self.positions.get(mid, 0.0)
             if mid in INNER_IDS:
-                tau = self.tau_inner * math.cos(pos) / GEAR_RATIO * ramp
+                tau = self.tau_inner * math.cos(pos + self.gravity_offset) / GEAR_RATIO * ramp
             else:
                 # 小臂: 需要绝对角度 = θ₁ + θ₂
                 # 这里用同侧大臂的角度
@@ -84,7 +85,7 @@ class TeachRecorder:
                 else:
                     theta1 = self.positions.get(2, 0.0)
                 abs_angle = theta1 + pos
-                tau = -self.tau_outer * math.cos(abs_angle) / GEAR_RATIO * ramp
+                tau = -self.tau_outer * math.cos(abs_angle + self.gravity_offset) / GEAR_RATIO * ramp
 
             cmd = UnitreeGO8010Command()
             cmd.id = mid
@@ -252,6 +253,8 @@ def main():
                         help='大臂重力矩 Nm (默认 0)')
     parser.add_argument('--tau-outer', type=float, default=0,
                         help='小臂重力矩 Nm (默认 0)')
+    parser.add_argument('--gravity-offset', type=float, default=-1.5708,
+                        help='零位到水平的角度偏移 rad (默认 -π/2, 零位=下垂)')
     parser.add_argument('--kd', type=float, default=0.005,
                         help='转子侧阻尼 (默认 0.005)')
     parser.add_argument('--ramp', type=float, default=1.5,

@@ -52,20 +52,15 @@ struct TeachFrame {
     std::array<double, 4> vel;  // v0, v1, v2, v3
 };
 
-// 处理后的轨迹（Reinsch 平滑样条）
+// 处理后的轨迹（去毛刺 + 低通滤波，直接回放数据点）
 struct ProcessedTrajectory {
     double duration;
     int n_frames;
-    std::vector<double> t;                    // 原始时间轴（归零后）
-    std::array<std::vector<double>, 4> pos;   // 节点位置（去毛刺后）
+    std::vector<double> t;                    // 数据时间轴（归零后）
+    std::array<std::vector<double>, 4> pos;   // 滤波后位置
+    std::array<std::vector<double>, 4> vel;   // 中心差分速度
 
-    // 三次样条系数: S_i(x) = a + b*(x-x_i) + c*(x-x_i)^2 + d*(x-x_i)^3
-    struct SplineCoeffs {
-        std::vector<double> a, b, c, d;       // 各段系数, 长度 = n_frames - 1
-    };
-    std::array<SplineCoeffs, 4> spline;       // 4 个电机各一组
-
-    // 通过样条插值获取 t 时刻的位置和速度
+    // 线性插值获取 t 时刻的位置和速度
     void get_state(double time, std::array<double, 4>& out_pos,
                    std::array<double, 4>& out_vel) const;
 };
@@ -74,8 +69,8 @@ class TeachPlaybackControlNode : public rclcpp::Node {
 public:
     TeachPlaybackControlNode();
 
-    /// 运行阻塞式主循环（校准 → 控制）
-    void run();
+    /// 加载轨迹并启动控制定时器（非阻塞）
+    void start();
 
     /// 刹车所有电机
     void brake_all();
@@ -85,10 +80,13 @@ private:
     void load_trajectory();
     bool calibrate_zero();
 
+    // ── 控制循环 (timer 回调) ──
+    void control_loop();
+
     // ── 轨迹处理 ──
     ProcessedTrajectory process_frames(
         const std::vector<TeachFrame>& frames,
-        double smooth_factor, double spike_thresh);
+        double filter_tau, double spike_thresh);
 
     // ── 回调 ──
     void state_callback(
@@ -111,6 +109,7 @@ private:
     rclcpp::Subscription<motor_control_ros2::msg::UnitreeGO8010State>::SharedPtr motor_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ir_sub_;
+    rclcpp::TimerBase::SharedPtr control_timer_;
 
     // ── 参数 ──
     std::string teach_file_;
@@ -118,7 +117,7 @@ private:
     double kp_, kd_;
     double kp_hold_, kd_hold_;
     double speed_;
-    double smooth_factor_;
+    double filter_tau_;
     double spike_thresh_;
     double tau_inner_, tau_outer_;
     double gravity_offset_inner_, gravity_offset_outer_;
@@ -126,6 +125,7 @@ private:
     int rate_hz_;
     std::string trigger_source_;
     int joy_button_;
+    double sym_diff_limit_;
 
     // ── 电机状态 ──
     std::map<int, double> positions_;
@@ -139,6 +139,7 @@ private:
     bool trigger_pending_;
     double phase_start_;
     std::array<double, 4> initial_pos_;
+    int loop_count_;
 
     // ── 轨迹 ──
     ProcessedTrajectory traj_;
