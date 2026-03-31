@@ -49,6 +49,7 @@ class TeachRecorder:
             UnitreeGO8010Command, '/unitree_go8010_command', 10)
         self.positions = {}
         self.velocities = {}
+        self.torques = {}
         self.temperatures = {}
         self.errors = {}
         self.last_update = {}
@@ -63,6 +64,7 @@ class TeachRecorder:
     def _state_cb(self, msg):
         self.positions[msg.motor_id] = msg.position
         self.velocities[msg.motor_id] = msg.velocity
+        self.torques[msg.motor_id] = msg.torque
         self.temperatures[msg.motor_id] = msg.temperature
         self.errors[msg.motor_id] = msg.error
         self.last_update[msg.motor_id] = time.time()
@@ -175,6 +177,7 @@ class TeachRecorder:
                 for mid in ALL_IDS:
                     record[f'm{mid}'] = self.positions.get(mid, 0.0)
                     record[f'v{mid}'] = self.velocities.get(mid, 0.0)
+                    record[f'tau{mid}'] = self.torques.get(mid, 0.0)
                 self.records.append(record)
 
             loop_count += 1
@@ -255,8 +258,8 @@ def main():
                         help='小臂重力矩 Nm (默认 0)')
     parser.add_argument('--gravity-offset', type=float, default=-1.5708,
                         help='零位到水平的角度偏移 rad (默认 -π/2, 零位=下垂)')
-    parser.add_argument('--kd', type=float, default=0.005,
-                        help='转子侧阻尼 (默认 0.005)')
+    parser.add_argument('--kd', type=float, default=0.0,
+                        help='转子侧阻尼 (默认 0, 纯零力拖动)')
     parser.add_argument('--ramp', type=float, default=1.5,
                         help='斜坡时间 s (默认 1.5)')
     parser.add_argument('--rate', type=int, default=200,
