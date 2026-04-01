@@ -62,6 +62,7 @@ add_library(motor_control_lib
   # 运动学
   src/steer_wheel_kinematics.cpp
   src/omni_wheel_kinematics.cpp
+  src/parallel_arm_kinematics.cpp
 )
 
 # 为库添加依赖
