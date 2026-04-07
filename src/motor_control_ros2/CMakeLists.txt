@@ -39,6 +39,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ChassisState.msg"
   "msg/SteerWheelState.msg"
   "msg/ArmTarget.msg"
+  "msg/StrikeCommand.msg"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 
@@ -263,6 +264,25 @@ set_target_properties(teach_playback_control_node PROPERTIES
   INSTALL_RPATH "$ORIGIN"
 )
 
+# C++ 可执行文件 - 双臂并联平面机构控制节点
+add_executable(parallel_arm_control_node
+  src/parallel_arm_control_node.cpp
+)
+
+target_link_libraries(parallel_arm_control_node
+  motor_control_lib
+  "${cpp_typesupport_target}"
+)
+
+ament_target_dependencies(parallel_arm_control_node
+  rclcpp
+  std_msgs
+)
+
+set_target_properties(parallel_arm_control_node PROPERTIES
+  INSTALL_RPATH "$ORIGIN"
+)
+
 # 安装目标
 install(TARGETS
   motor_control_lib
@@ -274,6 +294,7 @@ install(TARGETS
   remote_control_node
   delta_arm_manager
   teach_playback_control_node
+  parallel_arm_control_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}

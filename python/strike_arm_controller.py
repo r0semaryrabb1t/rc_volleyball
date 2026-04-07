@@ -39,8 +39,8 @@ MOTOR_R1 = {"id": 2, "device": "/dev/ttyUSB1", "name": "strike_motor_R1"}  # 右
 MOTOR_R2 = {"id": 3, "device": "/dev/ttyUSB1", "name": "strike_motor_R2"}  # 右 θ2
 
 # 默认 PD 增益
-DEFAULT_KP = 60.0
-DEFAULT_KD = 6.0
+DEFAULT_KP = 0.01
+DEFAULT_KD = 0.01
 
 # 安全限位（弧度）
 Q1_MIN = math.radians(0)
