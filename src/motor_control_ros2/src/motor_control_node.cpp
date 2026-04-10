@@ -290,10 +290,17 @@ private:
     if (motor_type == MotorType::DJI_GM6020 || motor_type == MotorType::DJI_GM3508) {
       auto motor = std::make_shared<DJIMotor>(config.name, motor_type, config.id, 0);
       motor->setInterfaceName(interface_name);  // 设置接口名称
+      motor->setDirection(config.direction);    // 设置方向（对称安装时用-1）
+      motor->setOffset(config.offset);          // 设置零位偏移（弧度）
       motors_[config.name] = motor;
       dji_motors_.push_back(motor);
-      RCLCPP_INFO(this->get_logger(), "添加 DJI 电机: %s (%s, ID=%d) -> %s", 
-                  config.name.c_str(), config.type.c_str(), config.id, interface_name.c_str());
+      if (!config.mirror_from.empty()) {
+        dji_mirror_map_[config.name] = config.mirror_from;
+      }
+      RCLCPP_INFO(this->get_logger(), "添加 DJI 电机: %s (%s, ID=%d, dir=%d, offset=%.4f rad%s) -> %s", 
+                  config.name.c_str(), config.type.c_str(), config.id, config.direction, config.offset,
+                  config.mirror_from.empty() ? "" : (", mirror=" + config.mirror_from).c_str(),
+                  interface_name.c_str());
     } else if (motor_type == MotorType::DAMIAO_DM4340 || motor_type == MotorType::DAMIAO_DM4310) {
       auto motor = std::make_shared<DamiaoMotor>(config.name, motor_type, config.id, 0);
       motor->setInterfaceName(interface_name);  // 设置接口名称
@@ -649,23 +656,9 @@ private:
                              data[0], data[1], data[2], data[3],
                              data[4], data[5], data[6], data[7]);
         
-        // ========== SendRecv 同步模式 ==========
-        // 发送命令后立即等待反馈（50us + 900us 超时）
-        // 这样可以避免数据堆积，确保 PID 及时响应
-        hardware::CANFrame response;
-        if (can_network_->sendRecv(interface_name, control_id, data, 8, response, 900)) {
-          // 收到反馈，立即更新电机状态
-          // 注意：DJI 电机的反馈 ID 与控制 ID 不同
-          // 反馈会通过 canRxCallback 自动分发到对应电机
-          RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                               "[CAN RX] %s 收到反馈 ID: 0x%03X", 
-                               interface_name.c_str(), response.can_id);
-        } else {
-          // 超时，记录警告
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                              "[CAN TIMEOUT] %s ID: 0x%03X 未收到反馈", 
-                              interface_name.c_str(), control_id);
-        }
+        // 只发送控制帧，反馈由接收线程统一处理
+        // 避免 sendRecv 与接收线程竞争串口数据导致编码器帧丢失
+        can_network_->send(interface_name, control_id, data, 8);
       }
     }
   }
@@ -714,7 +707,29 @@ private:
       msg.joint_name = motor->getJointName();
       msg.model = (motor->getMotorType() == MotorType::DJI_GM6020) ? "GM6020" : "GM3508";
       msg.online = motor->isOnline();
-      msg.angle = motor->getOutputPosition() * 180.0 / M_PI;
+      // 如果配置了镜像源，使用源电机的角度（方向和偏移仍由自身配置决定）
+      auto mirror_it = dji_mirror_map_.find(motor->getJointName());
+      if (mirror_it != dji_mirror_map_.end()) {
+        auto src_it = motors_.find(mirror_it->second);
+        if (src_it != motors_.end()) {
+          auto src_dji = std::dynamic_pointer_cast<DJIMotor>(src_it->second);
+          if (src_dji) {
+            // 镜像模式：直接使用源电机的角度，应用目标电机的 offset
+            double src_output_rad = src_dji->getOutputPosition();
+            double output_rad = src_output_rad - motor->getOffset();
+            double degrees = output_rad * 180.0 / M_PI;
+            degrees = fmod(degrees, 360.0);
+            if (degrees < 0) degrees += 360.0;
+            msg.angle = degrees;
+          } else {
+            msg.angle = motor->getAngleDegrees();
+          }
+        } else {
+          msg.angle = motor->getAngleDegrees();
+        }
+      } else {
+        msg.angle = motor->getAngleDegrees();
+      }
       msg.temperature = static_cast<uint8_t>(motor->getTemperature());
       msg.control_frequency = actual_control_freq_;  // 添加控制频率
       dji_state_pub_->publish(msg);
@@ -1056,6 +1071,7 @@ private:
   std::shared_ptr<hardware::SerialNetwork> serial_network_;  // 原生串口网络
   std::map<std::string, std::shared_ptr<MotorBase>> motors_;
   std::vector<std::shared_ptr<DJIMotor>> dji_motors_;
+  std::map<std::string, std::string> dji_mirror_map_;  // target -> source 镜像映射
   
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr reconnect_timer_;  // 设备重连定时器

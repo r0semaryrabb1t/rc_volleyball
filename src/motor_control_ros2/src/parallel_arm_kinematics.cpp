@@ -10,21 +10,37 @@ ParallelArmKinematics::ParallelArmKinematics()
 ParallelArmKinematics::ParallelArmKinematics(const Params& params)
     : params_(params), half_D_(params.D / 2.0) {}
 
+// ======================== 角度转换 ========================
+
+double ParallelArmKinematics::motorToKinTheta1(double motor_theta1) const {
+    return motor_theta1 + params_.theta1_offset;
+}
+double ParallelArmKinematics::motorToKinTheta2(double motor_theta2) const {
+    return motor_theta2 + params_.theta2_rel_offset;
+}
+double ParallelArmKinematics::kinToMotorTheta1(double kin_theta1) const {
+    return kin_theta1 - params_.theta1_offset;
+}
+double ParallelArmKinematics::kinToMotorTheta2(double kin_theta2) const {
+    return kin_theta2 - params_.theta2_rel_offset;
+}
+
 // ======================== 单臂正运动学 ========================
 
 ParallelArmKinematics::EndPoint
 ParallelArmKinematics::singleArmFK(double theta1, double theta2_rel) const {
     /*
-     * 标准平面 RR 正运动学：
-     *   x = L1·cos(θ1) + L2·cos(θ1 + θ2_rel)
-     *   y = L1·sin(θ1) + L2·sin(θ1 + θ2_rel)
+     * 输入：电机角度（motor space）
+     * 内部转换为运动学角度后用标准 RR 公式
      */
+    double t1 = motorToKinTheta1(theta1);
+    double t2 = motorToKinTheta2(theta2_rel);
     double L1 = params_.L1;
     double L2 = params_.L2;
-    double abs_angle = theta1 + theta2_rel;
+    double abs_angle = t1 + t2;
 
-    double x = L1 * std::cos(theta1) + L2 * std::cos(abs_angle);
-    double y = L1 * std::sin(theta1) + L2 * std::sin(abs_angle);
+    double x = L1 * std::cos(t1) + L2 * std::cos(abs_angle);
+    double y = L1 * std::sin(t1) + L2 * std::sin(abs_angle);
 
     return EndPoint{x, y};
 }
@@ -34,16 +50,7 @@ ParallelArmKinematics::singleArmFK(double theta1, double theta2_rel) const {
 std::optional<ParallelArmKinematics::SingleArmSolution>
 ParallelArmKinematics::singleArmIK(double x, double y, bool elbow_up) const {
     /*
-     * 标准平面 RR 逆运动学：
-     *   d = sqrt(x² + y²)
-     *   可达条件：|L1-L2| ≤ d ≤ L1+L2
-     *
-     *   cos(θ2_rel) = (d² - L1² - L2²) / (2·L1·L2)
-     *   θ2_rel = ±acos(...)  （elbow_up 取正，elbow_down 取负）
-     *
-     *   β = atan2(L2·sin(θ2_rel), L1 + L2·cos(θ2_rel))
-     *   α = atan2(y, x)
-     *   θ1 = α - β
+     * 标准 RR 逆运动学求运动学角度，然后转回电机角度输出。
      */
     double L1 = params_.L1;
     double L2 = params_.L2;
@@ -58,13 +65,17 @@ ParallelArmKinematics::singleArmIK(double x, double y, bool elbow_up) const {
     double cos_theta2 = (d2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
     cos_theta2 = std::clamp(cos_theta2, -1.0, 1.0);
 
-    double theta2_rel = elbow_up ? std::acos(cos_theta2) : -std::acos(cos_theta2);
+    double theta2_kin = elbow_up ? std::acos(cos_theta2) : -std::acos(cos_theta2);
 
     double alpha = std::atan2(y, x);
-    double beta = std::atan2(L2 * std::sin(theta2_rel), L1 + L2 * std::cos(theta2_rel));
-    double theta1 = alpha - beta;
+    double beta = std::atan2(L2 * std::sin(theta2_kin), L1 + L2 * std::cos(theta2_kin));
+    double theta1_kin = alpha - beta;
 
-    return SingleArmSolution{theta1, theta2_rel};
+    // 转回电机角度
+    double theta1_motor = kinToMotorTheta1(theta1_kin);
+    double theta2_motor = kinToMotorTheta2(theta2_kin);
+
+    return SingleArmSolution{theta1_motor, theta2_motor};
 }
 
 // ======================== 单臂雅可比 ========================
@@ -72,15 +83,17 @@ ParallelArmKinematics::singleArmIK(double x, double y, bool elbow_up) const {
 std::array<double, 4>
 ParallelArmKinematics::singleArmJacobian(double theta1, double theta2_rel) const {
     /*
-     * J = [ -L1·sin(θ1) - L2·sin(θ1+θ2),  -L2·sin(θ1+θ2) ]
-     *     [  L1·cos(θ1) + L2·cos(θ1+θ2),   L2·cos(θ1+θ2) ]
+     * 输入：电机角度，内部转换为运动学角度计算 Jacobian
+     * Jacobian 不受偏移影响（偏移是常量，导数为零）
      */
+    double t1 = motorToKinTheta1(theta1);
+    double t2 = motorToKinTheta2(theta2_rel);
     double L1 = params_.L1;
     double L2 = params_.L2;
-    double s1 = std::sin(theta1);
-    double c1 = std::cos(theta1);
-    double s12 = std::sin(theta1 + theta2_rel);
-    double c12 = std::cos(theta1 + theta2_rel);
+    double s1 = std::sin(t1);
+    double c1 = std::cos(t1);
+    double s12 = std::sin(t1 + t2);
+    double c12 = std::cos(t1 + t2);
 
     return {
         -L1 * s1 - L2 * s12,   // J11 = ∂x/∂θ1

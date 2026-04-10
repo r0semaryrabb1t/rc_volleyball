@@ -304,9 +304,10 @@ bool CANInterface::sendRecv(uint32_t can_id, const uint8_t* data, size_t len,
     
     // 尝试解析帧
     if (parseFrame(response)) {
-      // 检查是否是期望的反馈（根据 CAN ID 匹配）
-      // DJI 电机：发送 ID 0x200/0x1FF/0x2FF，反馈 ID 0x201-0x208/0x205-0x20B
-      // 这里简化处理：接收到任何帧都认为是反馈
+      // 先分发给回调，确保电机反馈不丢失
+      if (rx_callback_) {
+        rx_callback_(interface_name_, response.can_id, response.data, response.len);
+      }
       return true;
     }
   }

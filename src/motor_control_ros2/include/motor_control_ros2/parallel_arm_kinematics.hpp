@@ -26,6 +26,14 @@ namespace motor_control {
  *   θ1     = 大臂绝对角度（从 +X 轴逆时针为正）
  *   θ2_rel = 小臂相对大臂的转角（小臂电机经零位偏移后即为 θ2_rel）
  *
+ * 电机零位：机械臂完全收紧时电机所在位置
+ *   θ1 范围：0° ~ 110°
+ *   θ2_rel 范围：0° ~ 80°
+ *
+ * 电机角度与运动学角度的映射（FK/IK 入口和出口均使用电机角度）：
+ *   θ1_kin     = θ1_motor + theta1_offset        （offset = -90°，零位大臂垂直向下）
+ *   θ2_rel_kin = θ2_motor + theta2_rel_offset     （offset = +70°，零位小臂相对大臂70°）
+ *
  * 正运动学：
  *   x = L1·cos(θ1) + L2·cos(θ1 + θ2_rel)
  *   y = L1·sin(θ1) + L2·sin(θ1 + θ2_rel)
@@ -41,11 +49,16 @@ public:
         double L2 = 0.221;          // 小臂长度 (m)：肘关节到末端
         double D  = 0.3506;         // 肩关节中心距 (m)
 
-        // 单臂电机限位 (rad)
-        double theta1_min = -M_PI;
-        double theta1_max =  M_PI;
-        double theta2_rel_min = -M_PI;
-        double theta2_rel_max =  M_PI;
+        // 电机零位偏移 (rad)：kinematic_angle = motor_angle + offset
+        // 零位 = 机械臂收紧（大臂垂直向下，小臂相对大臂 70°）
+        double theta1_offset     = -M_PI / 2.0;            // 大臂：motor=0 → kin=-90°
+        double theta2_rel_offset = 70.0 * M_PI / 180.0;    // 小臂：motor=0 → kin=70°
+
+        // 单臂电机限位 (rad)  — 零位 = 机械臂收紧
+        double theta1_min     = 0.0;
+        double theta1_max     = 110.0 * M_PI / 180.0;   // 110°
+        double theta2_rel_min = 0.0;
+        double theta2_rel_max = 80.0 * M_PI / 180.0;     // 80°
     };
 
     // ===================== 结果类型 =====================
@@ -73,6 +86,14 @@ public:
 
     ParallelArmKinematics();
     explicit ParallelArmKinematics(const Params& params);
+
+    // ===================== 角度转换 =====================
+    /// 电机角度 → 运动学角度
+    double motorToKinTheta1(double motor_theta1) const;
+    double motorToKinTheta2(double motor_theta2) const;
+    /// 运动学角度 → 电机角度
+    double kinToMotorTheta1(double kin_theta1) const;
+    double kinToMotorTheta2(double kin_theta2) const;
 
     // ===================== 单臂运动学 =====================
 
