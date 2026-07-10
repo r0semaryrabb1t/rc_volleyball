@@ -14,3 +14,36 @@ can_interfaces:
   - name: DJI3508_4
     type: GM3508
     id: 4
+
+# 宇树电机 RS485 串口配置（USB转RS485适配器）
+serial_interfaces:
+- device: /dev/ttyUSB0
+  baudrate: 4000000
+  motors:
+  - name: Unitree8010_1
+    type: UNITREE_GO8010
+    id: 0
+    kp: 0.05
+    kd: 0.005
+    offset: 0.369349
+  - name: Unitree8010_2
+    type: UNITREE_GO8010
+    id: 1
+    kp: 0.05
+    kd: 0.005
+    offset: 0.512266
+- device: /dev/ttyUSB1
+  baudrate: 4000000
+  motors:
+  - name: Unitree8010_3
+    type: UNITREE_GO8010
+    id: 2
+    kp: 0.05
+    kd: 0.005
+    offset: 0.783499
+  - name: Unitree8010_4
+    type: UNITREE_GO8010
+    id: 3
+    kp: 0.05
+    kd: 0.005
+    offset: 0.028535

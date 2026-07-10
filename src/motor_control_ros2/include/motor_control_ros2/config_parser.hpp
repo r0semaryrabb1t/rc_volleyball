@@ -17,6 +17,9 @@ struct MotorConfig {
   int direction = 1;
   double offset = 0.0;
   std::string mirror_from;
+  // 宇树电机特有参数
+  double kp = 0.0;
+  double kd = 0.0;
 };
 
 struct CANInterfaceConfig {
@@ -25,8 +28,15 @@ struct CANInterfaceConfig {
   std::vector<MotorConfig> motors;
 };
 
+struct SerialInterfaceConfig {
+  std::string device;
+  int baudrate;
+  std::vector<MotorConfig> motors;
+};
+
 struct SystemConfig {
   std::vector<CANInterfaceConfig> can_interfaces;
+  std::vector<SerialInterfaceConfig> serial_interfaces;
 };
 
 class ConfigParser {

@@ -16,6 +16,22 @@ SystemConfig ConfigParser::loadConfig(const std::string& config_file) {
         config.can_interfaces.push_back(parseCANInterface(interface_node));
       }
     }
+    if (yaml["serial_interfaces"]) {
+      for (const auto& interface_node : yaml["serial_interfaces"]) {
+        SerialInterfaceConfig serial_config;
+        if (!interface_node["device"] || !interface_node["baudrate"]) {
+          throw std::runtime_error("串口接口配置必须包含 device/baudrate");
+        }
+        serial_config.device = interface_node["device"].as<std::string>();
+        serial_config.baudrate = interface_node["baudrate"].as<int>();
+        if (interface_node["motors"]) {
+          for (const auto& motor_node : interface_node["motors"]) {
+            serial_config.motors.push_back(parseMotorConfig(motor_node));
+          }
+        }
+        config.serial_interfaces.push_back(serial_config);
+      }
+    }
   } catch (const YAML::Exception& e) {
     throw std::runtime_error("YAML 解析错误: " + std::string(e.what()));
   }
@@ -42,6 +58,12 @@ MotorConfig ConfigParser::parseMotorConfig(const YAML::Node& node) {
   }
   if (node["mirror_from"]) {
     config.mirror_from = node["mirror_from"].as<std::string>();
+  }
+  if (node["kp"]) {
+    config.kp = node["kp"].as<double>();
+  }
+  if (node["kd"]) {
+    config.kd = node["kd"].as<double>();
   }
 
   return config;

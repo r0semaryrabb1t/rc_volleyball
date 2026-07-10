@@ -12,7 +12,8 @@ namespace motor_control {
  */
 enum class MotorType {
   DJI_GM3508,
-  DJI_GM6020
+  DJI_GM6020,
+  UNITREE_GO8010
 };
 
 /**
