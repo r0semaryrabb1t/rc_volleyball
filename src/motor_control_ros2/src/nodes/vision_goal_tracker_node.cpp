@@ -132,6 +132,24 @@ private:
       declare_parameter<double>("realtime_switch_enter_distance", realtime_switch_enter_distance_);
     realtime_switch_exit_distance_ =
       declare_parameter<double>("realtime_switch_exit_distance", realtime_switch_exit_distance_);
+    realtime_band_min_distance_ =
+      declare_parameter<double>("realtime_band_min_distance", realtime_band_min_distance_);
+    realtime_band_max_distance_ =
+      declare_parameter<double>("realtime_band_max_distance", realtime_band_max_distance_);
+    realtime_band_hysteresis_ =
+      declare_parameter<double>("realtime_band_hysteresis", realtime_band_hysteresis_);
+    target_source_min_hold_time_ =
+      declare_parameter<double>("target_source_min_hold_time", target_source_min_hold_time_);
+    realtime_forward_fallback_enabled_ = declare_parameter<bool>(
+      "realtime_forward_fallback_enabled", realtime_forward_fallback_enabled_);
+    final_lock_enabled_ = declare_parameter<bool>("final_lock_enabled", final_lock_enabled_);
+    final_lock_distance_ = declare_parameter<double>("final_lock_distance", final_lock_distance_);
+    final_lock_update_gate_ =
+      declare_parameter<double>("final_lock_update_gate", final_lock_update_gate_);
+    final_lock_update_alpha_ =
+      declare_parameter<double>("final_lock_update_alpha", final_lock_update_alpha_);
+    final_lock_reset_jump_ =
+      declare_parameter<double>("final_lock_reset_jump", final_lock_reset_jump_);
     realtime_timeout_ = declare_parameter<double>("realtime_timeout", realtime_timeout_);
     auto_goal_hold_time_ =
       declare_parameter<double>("auto_goal_hold_time", auto_goal_hold_time_);
@@ -166,6 +184,11 @@ private:
       declare_parameter<double>("approach_slow_distance", approach_slow_distance_);
     max_near_forward_velocity_ =
       declare_parameter<double>("max_near_forward_velocity", max_near_forward_velocity_);
+    braking_profile_enabled_ =
+      declare_parameter<bool>("braking_profile_enabled", braking_profile_enabled_);
+    braking_start_distance_ =
+      declare_parameter<double>("braking_start_distance", braking_start_distance_);
+    braking_decel_ = declare_parameter<double>("braking_decel", braking_decel_);
     reverse_deadband_ = declare_parameter<double>("reverse_deadband", reverse_deadband_);
     forward_sign_ = declare_parameter<double>("forward_sign", forward_sign_);
     lateral_sign_ = declare_parameter<double>("lateral_sign", lateral_sign_);
@@ -193,6 +216,18 @@ private:
     realtime_switch_enter_distance_ = std::max(0.0, realtime_switch_enter_distance_);
     realtime_switch_exit_distance_ = std::max(
       realtime_switch_enter_distance_, realtime_switch_exit_distance_);
+    realtime_band_min_distance_ = std::max(0.0, realtime_band_min_distance_);
+    realtime_band_max_distance_ = std::max(0.0, realtime_band_max_distance_);
+    if (realtime_band_max_distance_ > 0.0 &&
+        realtime_band_max_distance_ < realtime_band_min_distance_) {
+      realtime_band_max_distance_ = realtime_band_min_distance_;
+    }
+    realtime_band_hysteresis_ = std::max(0.0, realtime_band_hysteresis_);
+    target_source_min_hold_time_ = std::max(0.0, target_source_min_hold_time_);
+    final_lock_distance_ = std::max(0.0, final_lock_distance_);
+    final_lock_update_gate_ = std::max(0.0, final_lock_update_gate_);
+    final_lock_update_alpha_ = std::clamp(final_lock_update_alpha_, 0.0, 1.0);
+    final_lock_reset_jump_ = std::max(0.0, final_lock_reset_jump_);
     realtime_timeout_ = std::max(0.05, realtime_timeout_);
     auto_goal_hold_time_ = std::max(0.05, auto_goal_hold_time_);
     auto_goal_correction_jump_gate_ = std::max(0.0, auto_goal_correction_jump_gate_);
@@ -212,6 +247,8 @@ private:
     max_linear_accel_ = std::abs(max_linear_accel_);
     approach_slow_distance_ = std::max(0.0, approach_slow_distance_);
     max_near_forward_velocity_ = std::abs(max_near_forward_velocity_);
+    braking_start_distance_ = std::max(0.0, braking_start_distance_);
+    braking_decel_ = std::max(0.0, braking_decel_);
     reverse_deadband_ = std::max(0.0, reverse_deadband_);
     yaw_hold_kp_ = std::abs(yaw_hold_kp_);
     yaw_hold_kd_ = std::abs(yaw_hold_kd_);
@@ -386,9 +423,14 @@ private:
       return;
     }
 
+    const std::string target_source(target.source);
     const TargetError target_error = targetErrorFromRobot(target.x, target.y);
     const double error_forward = target_error.forward - stop_forward_distance_;
-    const double raw_error_left = target_error.left;
+    double raw_error_left = target_error.left;
+    if (target_source.find("realtime_lateral") != std::string::npos && has_realtime_) {
+      raw_error_left =
+        targetErrorFromRobot(latest_realtime_.point.x, latest_realtime_.point.y).left;
+    }
     double error_left = raw_error_left;
     if (lateral_overshoot_distance_ > 1e-6 &&
         std::abs(raw_error_left) > lateral_overshoot_deadband_) {
@@ -396,11 +438,11 @@ private:
     }
 
     const bool lateral_only =
-      std::string(target.source) == "realtime" &&
+      target_source == "realtime" &&
       realtime_lateral_only_when_slow_ &&
       (!has_realtime_speed_ || realtime_speed_ < realtime_chase_min_speed_);
     const bool auto_goal_correction_slow =
-      std::string(target.source) == "auto_goal" &&
+      target_source.rfind("auto_goal", 0) == 0 &&
       (auto_goal_correction_slow_until_ - now_time).seconds() > 0.0;
     const double correction_scale =
       auto_goal_correction_slow ? auto_goal_correction_speed_scale_ : 1.0;
@@ -420,6 +462,12 @@ private:
           active_max_near_forward_velocity +
           (active_max_forward_velocity - active_max_near_forward_velocity) * scale;
         cmd.linear.y = std::min(cmd.linear.y, forward_limit);
+      }
+      if (cmd.linear.y > 0.0 && braking_profile_enabled_ && braking_decel_ > 1e-6 &&
+          braking_start_distance_ > 1e-6 && error_forward <= braking_start_distance_) {
+        const double braking_distance = std::max(0.0, error_forward);
+        const double braking_limit = std::sqrt(2.0 * braking_decel_ * braking_distance);
+        cmd.linear.y = std::min(cmd.linear.y, braking_limit);
       } else if (error_forward > -reverse_deadband_) {
         cmd.linear.y = std::max(0.0, cmd.linear.y);
       }
@@ -512,6 +560,85 @@ private:
     has_published_cmd_ = true;
   }
 
+  void clearFinalLock(const char* reason)
+  {
+    if (!has_final_lock_) {
+      return;
+    }
+    RCLCPP_INFO(
+      get_logger(), "落点锁定清除: reason=%s locked=(%.2f, %.2f)",
+      reason, final_locked_x_, final_locked_y_);
+    has_final_lock_ = false;
+  }
+
+  void maybeResetFinalLockForNewTarget(bool fresh_auto, bool fresh_pre_goal)
+  {
+    if (!has_final_lock_) {
+      return;
+    }
+    if (!final_lock_enabled_) {
+      clearFinalLock("disabled");
+      return;
+    }
+    if (!fresh_auto && !fresh_pre_goal) {
+      clearFinalLock("target_timeout");
+      return;
+    }
+    if (final_lock_reset_jump_ <= 1e-6) {
+      return;
+    }
+
+    if (fresh_auto) {
+      return;
+    }
+
+    const double jump = std::hypot(
+      latest_pre_goal_.pose.position.x - final_locked_x_,
+      latest_pre_goal_.pose.position.y - final_locked_y_);
+    if (jump >= final_lock_reset_jump_) {
+      clearFinalLock("new_pre_goal");
+    }
+  }
+
+  void updateFinalLock(const rclcpp::Time& now_time)
+  {
+    if (!final_lock_enabled_ || final_lock_distance_ <= 1e-6 || !has_goal_) {
+      return;
+    }
+
+    const double goal_x = latest_goal_.pose.position.x;
+    const double goal_y = latest_goal_.pose.position.y;
+    const TargetError error = targetErrorFromRobot(goal_x, goal_y);
+    if (!has_final_lock_) {
+      if (error.distance <= final_lock_distance_) {
+        final_locked_x_ = goal_x;
+        final_locked_y_ = goal_y;
+        final_lock_time_ = now_time;
+        has_final_lock_ = true;
+        RCLCPP_INFO(
+          get_logger(),
+          "落点锁定: goal=(%.2f, %.2f) distance=%.2f lock_distance=%.2f",
+          final_locked_x_, final_locked_y_, error.distance, final_lock_distance_);
+      }
+      return;
+    }
+
+    const double jump = std::hypot(goal_x - final_locked_x_, goal_y - final_locked_y_);
+    if (jump <= final_lock_update_gate_) {
+      final_locked_x_ =
+        (1.0 - final_lock_update_alpha_) * final_locked_x_ + final_lock_update_alpha_ * goal_x;
+      final_locked_y_ =
+        (1.0 - final_lock_update_alpha_) * final_locked_y_ + final_lock_update_alpha_ * goal_y;
+      final_lock_time_ = now_time;
+      return;
+    }
+
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 500,
+      "落点已锁定，忽略大跳变: locked=(%.2f, %.2f) new=(%.2f, %.2f) jump=%.2f gate=%.2f",
+      final_locked_x_, final_locked_y_, goal_x, goal_y, jump, final_lock_update_gate_);
+  }
+
   bool selectTarget(const rclcpp::Time& now_time, TargetPoint& target)
   {
     const double auto_goal_age = has_goal_ ? (now_time - last_goal_time_).seconds() : 0.0;
@@ -546,40 +673,88 @@ private:
         has_guidance = true;
       }
 
+      maybeResetFinalLockForNewTarget(fresh_auto, fresh_pre_goal);
+      if (fresh_auto) {
+        updateFinalLock(now_time);
+      }
+      if (has_final_lock_) {
+        guidance.x = final_locked_x_;
+        guidance.y = final_locked_y_;
+        guidance.source = "auto_goal_locked";
+        has_guidance = true;
+      }
+
       if (has_guidance) {
         const double distance = targetDistanceFromRobot(guidance.x, guidance.y);
         const bool was_realtime = use_realtime_target_;
-        if (!use_realtime_target_ && fresh_realtime &&
-            distance <= realtime_switch_enter_distance_) {
-          use_realtime_target_ = true;
-        } else if (use_realtime_target_ && distance >= realtime_switch_exit_distance_) {
-          use_realtime_target_ = false;
+        if (realtime_band_max_distance_ > realtime_band_min_distance_) {
+          const double min_enter = realtime_band_min_distance_ + realtime_band_hysteresis_;
+          const double min_exit =
+            std::max(0.0, realtime_band_min_distance_ - realtime_band_hysteresis_);
+          const double max_enter =
+            std::max(min_enter, realtime_band_max_distance_ - realtime_band_hysteresis_);
+          const double max_exit = realtime_band_max_distance_ + realtime_band_hysteresis_;
+          bool next_realtime = false;
+          if (fresh_realtime) {
+            next_realtime = use_realtime_target_
+              ? (distance > min_exit && distance < max_exit)
+              : (distance >= min_enter && distance <= max_enter);
+          }
+          if (next_realtime != use_realtime_target_ && has_source_switch_time_ &&
+              target_source_min_hold_time_ > 0.0 &&
+              (now_time - last_source_switch_time_).seconds() < target_source_min_hold_time_) {
+            next_realtime = use_realtime_target_;
+          }
+          use_realtime_target_ = next_realtime;
+        } else {
+          if (!use_realtime_target_ && fresh_realtime &&
+              distance <= realtime_switch_enter_distance_) {
+            use_realtime_target_ = true;
+          } else if (use_realtime_target_ && distance >= realtime_switch_exit_distance_) {
+            use_realtime_target_ = false;
+          }
         }
         if (was_realtime != use_realtime_target_) {
-          RCLCPP_INFO(
-            get_logger(),
-            "视觉目标源切换: %s -> %s distance=%.2f enter=%.2f exit=%.2f realtime_fresh=%d",
-            was_realtime ? "realtime" : guidance.source,
-            use_realtime_target_ ? "realtime" : guidance.source, distance,
-            realtime_switch_enter_distance_, realtime_switch_exit_distance_, fresh_realtime);
+          last_source_switch_time_ = now_time;
+          has_source_switch_time_ = true;
+          if (realtime_band_max_distance_ > realtime_band_min_distance_) {
+            RCLCPP_INFO(
+              get_logger(),
+              "视觉目标源切换: %s -> %s distance=%.2f realtime_band=(%.2f, %.2f) hysteresis=%.2f realtime_fresh=%d",
+              was_realtime ? "realtime" : guidance.source,
+              use_realtime_target_ ? "realtime" : guidance.source, distance,
+              realtime_band_min_distance_, realtime_band_max_distance_,
+              realtime_band_hysteresis_, fresh_realtime);
+          } else {
+            RCLCPP_INFO(
+              get_logger(),
+              "视觉目标源切换: %s -> %s distance=%.2f enter=%.2f exit=%.2f realtime_fresh=%d",
+              was_realtime ? "realtime" : guidance.source,
+              use_realtime_target_ ? "realtime" : guidance.source, distance,
+              realtime_switch_enter_distance_, realtime_switch_exit_distance_, fresh_realtime);
+          }
         }
       } else if (fresh_realtime) {
-        use_realtime_target_ = true;
+        use_realtime_target_ = realtime_forward_fallback_enabled_;
       } else {
         use_realtime_target_ = false;
       }
 
-      if (use_realtime_target_ && fresh_realtime) {
-        target.x = latest_realtime_.point.x;
-        target.y = latest_realtime_.point.y;
-        target.source = "realtime";
-        return true;
-      }
       if (has_guidance) {
         target = guidance;
+        if (use_realtime_target_ && fresh_realtime) {
+          const std::string guidance_source(guidance.source);
+          if (guidance_source == "auto_goal_locked") {
+            target.source = "auto_goal_locked+realtime_lateral";
+          } else if (guidance_source == "auto_goal") {
+            target.source = "auto_goal+realtime_lateral";
+          } else {
+            target.source = "pre_goal+realtime_lateral";
+          }
+        }
         return true;
       }
-      if (fresh_realtime) {
+      if (fresh_realtime && realtime_forward_fallback_enabled_) {
         target.x = latest_realtime_.point.x;
         target.y = latest_realtime_.point.y;
         target.source = "realtime";
@@ -652,12 +827,13 @@ private:
 
     RCLCPP_INFO(
       get_logger(),
-      "视觉追点: source=%s target=(%.2f, %.2f) odom=(%.2f, %.2f) speed=%.2f mode=%s yaw_err=%.3f yaw_rate=%.3f cmd=(right %.2f, forward %.2f, yaw %.2f)",
+      "视觉追点: source=%s target=(%.2f, %.2f) odom=(%.2f, %.2f) speed=%.2f mode=%s final_lock=%d yaw_err=%.3f yaw_rate=%.3f cmd=(right %.2f, forward %.2f, yaw %.2f)",
       target.source, target.x, target.y,
       has_odom_ ? latest_odom_.pose.pose.position.x : 0.0,
       has_odom_ ? latest_odom_.pose.pose.position.y : 0.0,
       has_realtime_speed_ ? realtime_speed_ : 0.0,
       lateral_only ? "lateral_only" : "chase",
+      has_final_lock_ ? 1 : 0,
       last_yaw_error_, latest_yaw_rate_, cmd.linear.x, cmd.linear.y, cmd.angular.z);
   }
 
@@ -680,6 +856,16 @@ private:
   double auto_goal_realtime_lockout_ {2.0};
   double realtime_switch_enter_distance_ {6.0};
   double realtime_switch_exit_distance_ {6.5};
+  double realtime_band_min_distance_ {0.0};
+  double realtime_band_max_distance_ {0.0};
+  double realtime_band_hysteresis_ {0.0};
+  double target_source_min_hold_time_ {0.0};
+  bool realtime_forward_fallback_enabled_ {true};
+  bool final_lock_enabled_ {false};
+  double final_lock_distance_ {5.0};
+  double final_lock_update_gate_ {0.35};
+  double final_lock_update_alpha_ {0.20};
+  double final_lock_reset_jump_ {2.0};
   double realtime_timeout_ {0.3};
   double auto_goal_hold_time_ {3.0};
   double auto_goal_correction_jump_gate_ {0.6};
@@ -700,6 +886,9 @@ private:
   double max_linear_accel_ {2.0};
   double approach_slow_distance_ {2.0};
   double max_near_forward_velocity_ {0.6};
+  bool braking_profile_enabled_ {false};
+  double braking_start_distance_ {5.0};
+  double braking_decel_ {1.2};
   double reverse_deadband_ {0.3};
   double forward_sign_ {1.0};
   double lateral_sign_ {-1.0};
@@ -732,7 +921,11 @@ private:
   bool has_realtime_speed_ {false};
   bool has_published_cmd_ {false};
   bool has_last_tracked_cmd_ {false};
+  bool has_source_switch_time_ {false};
   bool use_realtime_target_ {false};
+  bool has_final_lock_ {false};
+  double final_locked_x_ {0.0};
+  double final_locked_y_ {0.0};
 
   rclcpp::Time last_goal_time_;
   rclcpp::Time last_pre_goal_time_;
@@ -742,7 +935,9 @@ private:
   rclcpp::Time last_log_time_;
   rclcpp::Time last_cmd_publish_time_;
   rclcpp::Time last_tracked_cmd_time_;
+  rclcpp::Time last_source_switch_time_;
   rclcpp::Time auto_goal_correction_slow_until_;
+  rclcpp::Time final_lock_time_;
   geometry_msgs::msg::Twist last_published_cmd_;
   geometry_msgs::msg::Twist last_tracked_cmd_;
 

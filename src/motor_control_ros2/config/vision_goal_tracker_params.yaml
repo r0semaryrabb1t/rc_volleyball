@@ -13,18 +13,28 @@ vision_goal_tracker_node:
 
     publish_rate: 50.0
     goal_timeout: 1.5
-    target_loss_hold_time: 0.20
+    target_loss_hold_time: 0.10
     odom_timeout: 0.8
     require_odom: true
 
-    # 4m 内追 realtime，4m 外追 auto_goal；realtime 仍丢弃明显异常远点。
-    max_goal_distance: 8.0
+    # auto/pre_goal 管前后距离和刹车；5-8m 只用 realtime 修横向；realtime 仍丢弃明显异常远点。
+    max_goal_distance: 16.0
     max_realtime_distance: 14.0
     max_realtime_abs_y: 5.0
     min_realtime_x: 0.0
-    auto_goal_realtime_lockout: 4.0
-    realtime_switch_enter_distance: 4.0
-    realtime_switch_exit_distance: 4.3
+    auto_goal_realtime_lockout: 5.0
+    realtime_switch_enter_distance: 5.0
+    realtime_switch_exit_distance: 8.0
+    realtime_band_min_distance: 5.0
+    realtime_band_max_distance: 8.0
+    realtime_band_hysteresis: 0.2
+    target_source_min_hold_time: 0.25
+    realtime_forward_fallback_enabled: false
+    final_lock_enabled: true
+    final_lock_distance: 5.0
+    final_lock_update_gate: 0.35
+    final_lock_update_alpha: 0.20
+    final_lock_reset_jump: 2.0
     realtime_timeout: 0.3
     auto_goal_hold_time: 0.6
     auto_goal_correction_jump_gate: 0.6
@@ -32,22 +42,25 @@ vision_goal_tracker_node:
     auto_goal_correction_speed_scale: 0.45
     pre_goal_hold_time: 2.0
     goal_tolerance: 0.10
-    stop_forward_distance: 0.30
+    stop_forward_distance: 0.55
     lateral_overshoot_distance: 0.20
     lateral_overshoot_deadband: 0.03
 
     # 视觉坐标默认约定: x=前方, y=左侧。
     # 底盘速度约定: linear.y=前进, linear.x=右移。
-    kp_forward: 4.2
+    kp_forward: 3.2
     kp_lateral: 1.9
-    max_forward_velocity: 6.0
+    max_forward_velocity: 4.2
     max_lateral_velocity: 2.4
     max_far_lateral_velocity: 1.0
     far_lateral_distance: 2.5
     max_backward_velocity: 1.0
     max_linear_accel: 10.0
-    approach_slow_distance: 0.65
-    max_near_forward_velocity: 2.2
+    approach_slow_distance: 2.0
+    max_near_forward_velocity: 0.7
+    braking_profile_enabled: true
+    braking_start_distance: 5.0
+    braking_decel: 1.2
     reverse_deadband: 0.2
     forward_sign: 1.0
     lateral_sign: -1.0
