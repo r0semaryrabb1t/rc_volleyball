@@ -11,14 +11,18 @@
  *      — 仅用于自动选方案，不触发状态机
  *   3. 订阅红外触发话题 /ir_trigger (std_msgs/Bool)
  *      — 触发状态机（与 LB 等价）
- *   4. 预置多套击球方案，每套包含独立的蓄力/击打/刹停参数
- *   5. 发布 unitree_go8010_command 控制 4 个 GO-M8010-6 电机
+ *   4. 订阅 /rc/strike_switch (std_msgs/UInt8)
+ *      — 中档蓄力，中→上 center，中→下 strong，断线后重新经过中档解锁
+ *   5. 预置多套击球方案，每套包含独立的蓄力/击打/刹停参数
+ *   6. 发布 unitree_go8010_command 控制 4 个 GO-M8010-6 电机
  *
  * 决策（选方案）：
  *   手柄 A/B/X/Y 四键 / 键盘 1/2/3/4 键 / 视觉落点 → 更新 active_profile
  *
  * 触发（状态转换）：
- *   手柄 LB / 红外 /ir_trigger → IDLE→蓄力, READY→击打
+ *   首次: IDLE → MOVING_TO_READY → READY
+ *   之后: READY → STRIKE_ACCEL → BRAKING → RETURNING → READY (循环)
+ *   回程: 小臂先收到蓄力位（避开障碍），大臂再回蓄力位
  *
  * 默认方案映射（可通过 yaml 修改）：
  *   A(0) / 键盘1 → "center"
@@ -34,12 +38,14 @@
 #include <sensor_msgs/msg/joy.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "motor_control_ros2/msg/unitree_go8010_command.hpp"
 #include "motor_control_ros2/msg/unitree_go8010_state.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <map>
@@ -132,11 +138,17 @@ public:
         ir_trigger_sub_ = create_subscription<std_msgs::msg::Bool>(
             ir_trigger_topic_, 10,
             [this](const std_msgs::msg::Bool::SharedPtr msg) {
-                if (msg->data) {
+                if (msg->data && !rcHasPriority()) {
                     ir_triggered_.store(true);
                     RCLCPP_INFO_ONCE(get_logger(), "红外触发接口已激活，话题: %s", ir_trigger_topic_.c_str());
                 }
             });
+
+        if (rc_switch_enabled_) {
+            rc_switch_sub_ = create_subscription<std_msgs::msg::UInt8>(
+                rc_switch_topic_, 10,
+                [this](const std_msgs::msg::UInt8::SharedPtr msg) { rcSwitchCallback(msg); });
+        }
 
         // 控制定时器 200 Hz
         using namespace std::chrono_literals;
@@ -155,6 +167,12 @@ public:
         kbd_thread_ = std::thread([this]() { keyboardLoop(); });
         RCLCPP_INFO(get_logger(),
             "键盘控制已启用: 1=center 2=left 3=right 4=strong  空格/Enter=触发  q=退出");
+        RCLCPP_INFO(get_logger(),
+            "遥控右拨杆: topic=%s UP/MID/DOWN=%d/%d/%d, 上=%s 下=%s, 遥控优先级=%s",
+            rc_switch_enabled_ ? rc_switch_topic_.c_str() : "disabled",
+            rc_switch_up_, rc_switch_mid_, rc_switch_down_,
+            rc_up_profile_.c_str(), rc_down_profile_.c_str(),
+            rc_switch_highest_priority_ ? "highest" : "normal");
     }
 
     ~StrikeNode() {
@@ -199,6 +217,16 @@ private:
         if (p["default_profile"])        active_profile_name_  = p["default_profile"].as<std::string>();
         if (p["ir_trigger_topic"])       ir_trigger_topic_     = p["ir_trigger_topic"].as<std::string>();
         if (p["ir_trigger_enabled"])     ir_trigger_enabled_   = p["ir_trigger_enabled"].as<bool>();
+        if (p["rc_switch_topic"])        rc_switch_topic_      = p["rc_switch_topic"].as<std::string>();
+        if (p["rc_switch_enabled"])      rc_switch_enabled_    = p["rc_switch_enabled"].as<bool>();
+        if (p["rc_switch_highest_priority"])
+            rc_switch_highest_priority_ = p["rc_switch_highest_priority"].as<bool>();
+        if (p["rc_switch_timeout_sec"])  rc_switch_timeout_sec_ = p["rc_switch_timeout_sec"].as<double>();
+        if (p["rc_switch_up"])           rc_switch_up_         = p["rc_switch_up"].as<int>();
+        if (p["rc_switch_mid"])          rc_switch_mid_        = p["rc_switch_mid"].as<int>();
+        if (p["rc_switch_down"])         rc_switch_down_       = p["rc_switch_down"].as<int>();
+        if (p["rc_up_profile"])          rc_up_profile_        = p["rc_up_profile"].as<std::string>();
+        if (p["rc_down_profile"])        rc_down_profile_      = p["rc_down_profile"].as<std::string>();
 
         // 手柄选方案按键映射（button index → profile name）
         if (p["joy_profile_buttons"]) {
@@ -244,6 +272,15 @@ private:
 
         if (profiles_.find(active_profile_name_) == profiles_.end()) {
             active_profile_name_ = profiles_.begin()->first;
+        }
+
+        rc_switch_timeout_sec_ = std::max(0.1, rc_switch_timeout_sec_);
+        if (rc_switch_up_ == rc_switch_mid_ || rc_switch_up_ == rc_switch_down_ ||
+            rc_switch_mid_ == rc_switch_down_) {
+            RCLCPP_WARN(get_logger(), "遥控拨杆值配置重复，恢复 DJI 默认值 UP/MID/DOWN=1/3/2");
+            rc_switch_up_ = 1;
+            rc_switch_mid_ = 3;
+            rc_switch_down_ = 2;
         }
     }
 
@@ -371,11 +408,13 @@ private:
 
             auto it = key_profile_map.find(static_cast<int>(c));
             if (it != key_profile_map.end()) {
-                selectProfile(it->second, "键盘");
+                if (!rcHasPriority()) selectProfile(it->second, "键盘");
             } else if (c == ' ' || c == '\n' || c == '\r') {
-                lb_pressed_.store(true);
-                RCLCPP_INFO(get_logger(), "[键盘] 触发 (当前方案: %s)",
-                    active_profile_name_.c_str());
+                if (!rcHasPriority()) {
+                    lb_pressed_.store(true);
+                    RCLCPP_INFO(get_logger(), "[键盘] 触发 (当前方案: %s)",
+                        active_profile_name_.c_str());
+                }
             } else if (c == 'q' || c == 'Q') {
                 RCLCPP_INFO(get_logger(), "[键盘] q → 退出");
                 rclcpp::shutdown();
@@ -388,6 +427,19 @@ private:
 
     void joyCallback(const sensor_msgs::msg::Joy::SharedPtr msg) {
         const auto& btns = msg->buttons;
+
+        if (rcHasPriority()) {
+            if (static_cast<int>(btns.size()) > joy_button_lb_) {
+                lb_prev_ = btns[joy_button_lb_];
+            }
+            for (const auto& [btn_idx, profile_name] : joy_profile_map_) {
+                (void)profile_name;
+                if (btn_idx < static_cast<int>(btns.size())) {
+                    joy_select_prev_[btn_idx] = btns[btn_idx];
+                }
+            }
+            return;
+        }
 
         // ── LB（触发键）上升沿 ──────────────────────────────
         if (static_cast<int>(btns.size()) > joy_button_lb_) {
@@ -421,14 +473,16 @@ private:
             pending_profile_ = name;
             return;
         }
+        pending_profile_.clear();
         if (active_profile_name_ != name) {
             active_profile_name_ = name;
-            pending_profile_.clear();
             RCLCPP_INFO(get_logger(), "%s → 方案: [%s]", source, name.c_str());
         }
     }
 
     void visionCallback(const PointStamped::SharedPtr msg) {
+        if (rcHasPriority()) return;
+
         std::lock_guard<std::mutex> lk(vision_mutex_);
         landing_x_    = msg->point.x;
         vision_stamp_ = now_sec();
@@ -445,14 +499,94 @@ private:
         selectProfile(new_profile, "视觉落点");
     }
 
+    void rcSwitchCallback(const std_msgs::msg::UInt8::SharedPtr msg) {
+        if (!msg || !rc_switch_enabled_) return;
+
+        const int sw = static_cast<int>(msg->data);
+        rc_last_switch_stamp_ = now_sec();
+        if (sw != rc_switch_up_ && sw != rc_switch_mid_ && sw != rc_switch_down_) {
+            resetRcInterlock();
+            return;
+        }
+
+        rc_control_active_.store(true);
+        lb_pressed_.store(false);
+        ir_triggered_.store(false);
+
+        if (sw == rc_switch_mid_) {
+            if (!rc_switch_armed_) {
+                rc_switch_armed_ = true;
+                RCLCPP_INFO(get_logger(), "遥控右拨杆中档：击球触发已解锁");
+                if (state_ == StrikeState::IDLE) {
+                    pending_profile_.clear();
+                    selectProfile(rc_up_profile_, "遥控中档蓄力");
+                    RCLCPP_INFO(get_logger(), "遥控中档 → 进入蓄力位 [方案: %s]",
+                                active_profile_name_.c_str());
+                    startMoveToReady();
+                }
+            }
+            rc_prev_switch_ = sw;
+            return;
+        }
+
+        const bool trigger_edge = rc_switch_armed_ && rc_prev_switch_ == rc_switch_mid_;
+        rc_prev_switch_ = sw;
+        if (!trigger_edge) return;
+
+        const std::string& profile = sw == rc_switch_up_ ? rc_up_profile_ : rc_down_profile_;
+        if (state_ != StrikeState::READY) {
+            RCLCPP_WARN(get_logger(),
+                "忽略遥控击球边沿：机械臂未处于 READY (请求方案: %s)", profile.c_str());
+            return;
+        }
+        if (profiles_.find(profile) == profiles_.end()) {
+            RCLCPP_ERROR(get_logger(), "忽略遥控击球边沿：未知方案 '%s'", profile.c_str());
+            return;
+        }
+
+        pending_profile_.clear();
+        selectProfile(profile, "遥控右拨杆");
+        RCLCPP_INFO(get_logger(), "遥控右拨杆触发 → 击打! [方案: %s]", profile.c_str());
+        startStrike();
+    }
+
+    bool rcHasPriority() const {
+        return rc_switch_highest_priority_ && rc_control_active_.load();
+    }
+
+    void resetRcInterlock() {
+        const bool was_active = rc_control_active_.exchange(false);
+        rc_switch_armed_ = false;
+        rc_prev_switch_ = 0;
+        lb_pressed_.store(false);
+        ir_triggered_.store(false);
+        if (was_active) {
+            RCLCPP_WARN(get_logger(), "遥控右拨杆链路失效：已锁止，需回中档后重新触发");
+        }
+    }
+
+    void checkRcSwitchTimeout() {
+        if (!rc_control_active_.load() || rc_last_switch_stamp_ < 0.0) return;
+        if ((now_sec() - rc_last_switch_stamp_) > rc_switch_timeout_sec_) {
+            resetRcInterlock();
+        }
+    }
+
     // ── 主控制循环 (200 Hz) ───────────────────────────────────
     void controlLoop() {
+        checkRcSwitchTimeout();
+
+        if (rcHasPriority()) {
+            lb_pressed_.store(false);
+            ir_triggered_.store(false);
+        }
+
         // 视觉超时降级
         checkVisionTimeout();
 
         switch (state_) {
             case StrikeState::IDLE:
-                if (lb_pressed_.exchange(false) || checkIrTrigger()) {
+                if (!rcHasPriority() && (lb_pressed_.exchange(false) || checkIrTrigger())) {
                     RCLCPP_INFO(get_logger(), "触发 → 蓄力 [方案: %s]",
                                 active_profile_name_.c_str());
                     startMoveToReady();
@@ -465,7 +599,7 @@ private:
 
             case StrikeState::READY:
                 holdPhase(activeProfile().ready);
-                if (lb_pressed_.exchange(false) || checkIrTrigger()) {
+                if (!rcHasPriority() && (lb_pressed_.exchange(false) || checkIrTrigger())) {
                     RCLCPP_INFO(get_logger(), "触发 → 击打! [方案: %s]",
                                 active_profile_name_.c_str());
                     startStrike();
@@ -619,23 +753,23 @@ private:
         move_time_ = prof.return_time;
         state_ = StrikeState::RETURNING;
         state_start_ = now_sec();
-    }
+    } 
 
     void updateReturn() {
         double t = std::min(1.0, elapsed() / move_time_);
-        double frac = t * t * (3.0 - 2.0 * t);
-        double pos_m = move_start_main_ + (move_target_main_ - move_start_main_) * frac;
-        double pos_s = move_start_sub_  + (move_target_sub_  - move_start_sub_)  * frac;
-
-        for (const auto* motor : {&motor_l1_, &motor_r1_}) {
-            sendFoc(*motor, pos_m, 0.0, 0.0, move_kp_, move_kd_);
-        }
-        for (const auto* motor : {&motor_l2_, &motor_r2_}) {
+            double frac = t * t * (3.0 - 2.0 * t);
+            double pos_m = move_start_main_ + (move_target_main_ - move_start_main_) * frac;
+            double pos_s = move_start_sub_  + (move_target_sub_  - move_start_sub_)  * frac;
+            
+            for (const auto* motor : {&motor_l1_, &motor_r1_}) {
+                sendFoc(*motor, pos_m, 0.0, 0.0, move_kp_, move_kd_);
+            }
+            for (const auto* motor : {&motor_l2_, &motor_r2_}) {
             sendFoc(*motor, pos_s, 0.0, 0.0, move_kp_, move_kd_);
-        }
+            }
 
-        if (elapsed() >= move_time_) {
-            RCLCPP_INFO(get_logger(), "回蓄力完成 → IDLE，等待下次触发");
+            if (elapsed() >= move_time_) {
+            RCLCPP_INFO(get_logger(), "回蓄力完成 → IDLE，等待下次触发");        
             applyPendingProfile();
             state_ = StrikeState::IDLE;
         }
@@ -649,6 +783,7 @@ private:
 
     // ── 视觉超时检查 ──────────────────────────────────────────
     void checkVisionTimeout() {        std::lock_guard<std::mutex> lk(vision_mutex_);
+        if (rcHasPriority()) return;
         if (vision_stamp_ > 0.0 && (now_sec() - vision_stamp_) > vision_timeout_sec_) {
             if (active_profile_name_ != "center") {
                 RCLCPP_WARN(get_logger(),
@@ -790,6 +925,15 @@ private:
     double vision_timeout_sec_  {2.0};
     std::string ir_trigger_topic_ {"/ir_trigger"};
     bool ir_trigger_enabled_    {true};
+    std::string rc_switch_topic_ {"/rc/strike_switch"};
+    bool rc_switch_enabled_ {true};
+    bool rc_switch_highest_priority_ {true};
+    double rc_switch_timeout_sec_ {0.5};
+    int rc_switch_up_ {1};
+    int rc_switch_mid_ {3};
+    int rc_switch_down_ {2};
+    std::string rc_up_profile_ {"center"};
+    std::string rc_down_profile_ {"strong"};
 
     // 击球方案
     std::map<std::string, StrikeProfile> profiles_;
@@ -822,12 +966,18 @@ private:
 
     // 击打阶段小臂延迟状态
     bool sub_arm_started_ {false};
+    // 回程两阶段: false=小臂先收, true=大臂回位
+    bool return_sub_phase_done_ {false};
 
     // 手柄
     std::atomic<bool> lb_pressed_ {false};
     int lb_prev_ {0};
     // 红外触发
     std::atomic<bool> ir_triggered_ {false};
+    std::atomic<bool> rc_control_active_ {false};
+    bool rc_switch_armed_ {false};
+    int rc_prev_switch_ {0};
+    double rc_last_switch_stamp_ {-1.0};
     // 键盘监听线程
     std::thread kbd_thread_;
     std::atomic<bool> kbd_running_ {false};
@@ -838,6 +988,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_sub_;
     rclcpp::Subscription<PointStamped>::SharedPtr vision_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ir_trigger_sub_;
+    rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr rc_switch_sub_;
     rclcpp::TimerBase::SharedPtr control_timer_;
 };
 

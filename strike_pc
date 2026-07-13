@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SESSION="${STRIKE_SESSION:-strike_pc}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_DIR="$SCRIPT_DIR"
+PKG_DIR="$WS_DIR/src/motor_control_ros2"
+ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
+INSTALL_SETUP="$WS_DIR/install/setup.bash"
+MOTOR_CONFIG="$PKG_DIR/config/motors.yaml"
+STRIKE_CONFIG="$PKG_DIR/config/strike_node_params.yaml"
+ROS_DOMAIN_ID_VALUE="${ROS_DOMAIN_ID:-0}"
+LOG_ROOT="$WS_DIR/log/strike_pc"
+ACTION="${1:-start}"
+
+usage() {
+  cat <<'EOF'
+用法: ./strike_pc [start|stop|restart|status|attach|logs]
+
+  start    启动击球臂（默认）
+  stop     停止击球臂
+  restart  重启击球臂
+  status   查看运行状态
+  attach   进入击球臂控制界面
+  logs     查看最近一次启动的日志目录
+
+环境变量:
+  ATTACH=0                  启动后不自动进入 tmux
+  AUTO_BUILD=0              源码更新后不自动编译
+  ALLOW_MISSING_DEVICES=1   缺少串口设备时仍继续启动
+  STRIKE_DEVICES="..."      覆盖默认设备列表
+  ROS_SETUP=/path/setup.bash 指定 ROS 2 环境
+EOF
+}
+
+session_exists() {
+  tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+stop_session() {
+  if ! session_exists; then
+    echo "击球臂未运行 (tmux: $SESSION)"
+    return
+  fi
+
+  echo "正在停止击球臂..."
+  tmux list-panes -t "$SESSION" -F '#{pane_id}' 2>/dev/null | while read -r pane; do
+    tmux send-keys -t "$pane" C-c 2>/dev/null || true
+  done
+  sleep 1
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  echo "击球臂已停止"
+}
+
+show_status() {
+  if ! session_exists; then
+    echo "击球臂未运行 (tmux: $SESSION)"
+    return 1
+  fi
+
+  echo "击球臂正在运行 (tmux: $SESSION)"
+  tmux list-panes -t "$SESSION" \
+    -F '  #{window_name}:#{pane_index}  pid=#{pane_pid}  command=#{pane_current_command}'
+}
+
+show_logs() {
+  if [ -L "$LOG_ROOT/latest" ] || [ -d "$LOG_ROOT/latest" ]; then
+    readlink -f "$LOG_ROOT/latest"
+  else
+    echo "尚无启动日志: $LOG_ROOT"
+    return 1
+  fi
+}
+
+require_file() {
+  if [ ! -f "$1" ]; then
+    echo "缺少文件: $1" >&2
+    exit 1
+  fi
+}
+
+source_setup() {
+  local setup_file="$1"
+  local rc
+
+  # ROS 2 setup scripts may read optional variables before defining them.
+  set +u
+  if source "$setup_file"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  set -u
+  return "$rc"
+}
+
+needs_build() {
+  local strike_bin="$WS_DIR/install/motor_control_ros2/lib/motor_control_ros2/strike_node"
+  local motor_bin="$WS_DIR/install/motor_control_ros2/lib/motor_control_ros2/motor_control_node"
+  local installed_config_dir="$WS_DIR/install/motor_control_ros2/share/motor_control_ros2/config"
+  local source_config
+  local installed_config
+
+  if [ ! -x "$strike_bin" ] || [ ! -x "$motor_bin" ] || [ ! -f "$INSTALL_SETUP" ]; then
+    return 0
+  fi
+
+  if [ "$PKG_DIR/CMakeLists.txt" -nt "$strike_bin" ] || \
+     [ "$PKG_DIR/package.xml" -nt "$strike_bin" ] || \
+     find "$PKG_DIR/src" "$PKG_DIR/include" "$PKG_DIR/msg" \
+       -type f -newer "$strike_bin" -print -quit | grep -q .; then
+    return 0
+  fi
+
+  for source_config in "$PKG_DIR"/config/*; do
+    [ -f "$source_config" ] || continue
+    installed_config="$installed_config_dir/$(basename "$source_config")"
+    if [ ! -f "$installed_config" ] || ! cmp -s "$source_config" "$installed_config"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+build_if_needed() {
+  if ! needs_build; then
+    return
+  fi
+
+  if [ "${AUTO_BUILD:-1}" != "1" ]; then
+    echo "源码或配置比已安装版本新，请先编译:" >&2
+    echo "  colcon build --packages-select motor_control_ros2" >&2
+    exit 1
+  fi
+
+  require_file "$ROS_SETUP"
+  if ! command -v colcon >/dev/null 2>&1; then
+    # colcon 可能仅在 ROS 环境加载后可见。
+    source_setup "$ROS_SETUP"
+  fi
+  if ! command -v colcon >/dev/null 2>&1; then
+    echo "未找到 colcon，无法自动编译" >&2
+    exit 1
+  fi
+
+  echo "检测到源码或配置有更新，正在编译 motor_control_ros2..."
+  (
+    cd "$WS_DIR"
+    source_setup "$ROS_SETUP"
+    colcon build --packages-select motor_control_ros2
+  )
+}
+
+check_devices() {
+  local -a configured_devices
+  local -a missing=()
+  local -a inaccessible=()
+  local device
+
+  read -r -a configured_devices <<< "${STRIKE_DEVICES:-/dev/ttyUSB0 /dev/ttyUSB1}"
+
+  echo "设备状态:"
+  for device in "${configured_devices[@]}"; do
+    if [ ! -e "$device" ]; then
+      echo "  缺少 $device"
+      missing+=("$device")
+    elif [ ! -r "$device" ] || [ ! -w "$device" ]; then
+      echo "  无读写权限 $device"
+      inaccessible+=("$device")
+    else
+      ls -l "$device"
+    fi
+  done
+
+  if [ "${#missing[@]}" -gt 0 ] && [ "${ALLOW_MISSING_DEVICES:-0}" != "1" ]; then
+    echo "串口设备不完整，已取消启动。确认接线后重试。" >&2
+    echo "调试时可用 ALLOW_MISSING_DEVICES=1 ./strike_pc 强制启动。" >&2
+    exit 1
+  fi
+
+  if [ "${#inaccessible[@]}" -gt 0 ]; then
+    echo "需要设置串口权限（可能要求输入 sudo 密码）..."
+    sudo chmod a+rw -- "${inaccessible[@]}"
+  fi
+}
+
+send_node() {
+  local pane="$1"
+  local name="$2"
+  local node_command="$3"
+  local log_file="$4"
+  local quoted_log
+  local pane_command
+
+  printf -v quoted_log '%q' "$log_file"
+  pane_command="$SOURCE_CMD && { echo '[$name] 日志: $log_file'; set -o pipefail; $node_command 2>&1 | tee -a $quoted_log; rc=\${PIPESTATUS[0]}; echo; echo \"[$name] 已退出，状态码: \$rc\"; }; exec bash"
+  tmux send-keys -t "$pane" -l "$pane_command"
+  tmux send-keys -t "$pane" Enter
+}
+
+start_system() {
+  local run_log_dir
+  local pane_motor
+  local pane_strike
+  local quoted_ws
+  local quoted_ros_setup
+  local quoted_install_setup
+  local quoted_motor_config
+  local quoted_ros_domain_id
+  local motor_command
+  local strike_command
+
+  command -v tmux >/dev/null 2>&1 || { echo "未安装 tmux" >&2; exit 1; }
+  require_file "$ROS_SETUP"
+  require_file "$MOTOR_CONFIG"
+  require_file "$STRIKE_CONFIG"
+
+  build_if_needed
+  require_file "$INSTALL_SETUP"
+  check_devices
+
+  if session_exists; then
+    echo "发现旧的击球臂会话，先停止再启动..."
+    stop_session
+  fi
+
+  run_log_dir="$LOG_ROOT/$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$run_log_dir"
+  ln -sfn "$run_log_dir" "$LOG_ROOT/latest"
+
+  printf -v quoted_ws '%q' "$WS_DIR"
+  printf -v quoted_ros_setup '%q' "$ROS_SETUP"
+  printf -v quoted_install_setup '%q' "$INSTALL_SETUP"
+  printf -v quoted_motor_config '%q' "$MOTOR_CONFIG"
+  printf -v quoted_ros_domain_id '%q' "$ROS_DOMAIN_ID_VALUE"
+
+  SOURCE_CMD="cd $quoted_ws && source $quoted_ros_setup && source $quoted_install_setup && export ROS_DOMAIN_ID=$quoted_ros_domain_id"
+  motor_command="ros2 run motor_control_ros2 motor_control_node --ros-args -p config_file:=$quoted_motor_config"
+  strike_command="ros2 run motor_control_ros2 strike_node"
+
+  echo "正在启动击球臂..."
+  pane_motor="$(tmux new-session -d -s "$SESSION" -n strike -P -F '#{pane_id}' bash)"
+  pane_strike="$(tmux split-window -t "$pane_motor" -v -P -F '#{pane_id}' bash)"
+
+  send_node "$pane_motor" "motor_control_node" "$motor_command" "$run_log_dir/motor_control_node.log"
+  send_node "$pane_strike" "strike_node" "$strike_command" "$run_log_dir/strike_node.log"
+  tmux select-layout -t "$SESSION":strike even-vertical >/dev/null
+  tmux select-pane -t "$pane_strike"
+
+  sleep 2
+  if ! session_exists; then
+    echo "启动失败，请检查日志: $run_log_dir" >&2
+    exit 1
+  fi
+
+  echo ""
+  echo "击球臂已启动 (tmux: $SESSION)"
+  echo "日志目录: $run_log_dir"
+  echo "键盘: 1/2/3/4 选方案，空格或 Enter 触发，q 退出"
+  echo "手柄: A/B/X/Y 选方案，LB 触发"
+  echo "退出界面但保持运行: Ctrl+B，再按 D"
+  echo "停止: $WS_DIR/strike_pc stop"
+
+  if [ "${ATTACH:-auto}" = "1" ] || { [ "${ATTACH:-auto}" = "auto" ] && [ -t 0 ] && [ -t 1 ]; }; then
+    exec tmux attach-session -t "$SESSION"
+  fi
+
+  echo "进入控制界面: $WS_DIR/strike_pc attach"
+}
+
+case "$ACTION" in
+  start)
+    start_system
+    ;;
+  restart)
+    command -v tmux >/dev/null 2>&1 || { echo "未安装 tmux" >&2; exit 1; }
+    stop_session
+    start_system
+    ;;
+  stop)
+    command -v tmux >/dev/null 2>&1 || { echo "未安装 tmux" >&2; exit 1; }
+    stop_session
+    ;;
+  status)
+    command -v tmux >/dev/null 2>&1 || { echo "未安装 tmux" >&2; exit 1; }
+    show_status
+    ;;
+  attach)
+    command -v tmux >/dev/null 2>&1 || { echo "未安装 tmux" >&2; exit 1; }
+    if ! session_exists; then
+      echo "击球臂未运行，请先执行: $WS_DIR/strike_pc" >&2
+      exit 1
+    fi
+    exec tmux attach-session -t "$SESSION"
+    ;;
+  logs)
+    show_logs
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "未知命令: $ACTION" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

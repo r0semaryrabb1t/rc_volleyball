@@ -1,4 +1,4 @@
-# 击球控制节点参数配置文件
+  # 击球控制节点参数配置文件
 #
 # GO-M8010-6 FOC 公式：
 #   τ = torque_ff + kp*(pos_target - pos) + kd*(vel_target - vel)
@@ -37,6 +37,19 @@ strike_node:
     # 红外触发接口（下位机 → positioning_bridge_node → /ir_trigger → strike_node）
     ir_trigger_topic: "/ir_trigger" # 红外触发话题（桥接节点发布）
     ir_trigger_enabled: true        # false=禁用红外触发，仅使用手柄/键盘
+
+    # DJI 右三档拨杆（由底盘 rc_usb_control_node 持续发布）
+    # 首次/重连后必须先收到中档才解锁；中→上=center，中→下=strong。
+    # 上/下→中不触发，保持上/下不连击，非 READY 状态的击球边沿直接忽略。
+    rc_switch_topic: "/rc/strike_switch"
+    rc_switch_enabled: true
+    rc_switch_highest_priority: true # RC 有效时屏蔽键盘、Xbox、红外和视觉选型/触发
+    rc_switch_timeout_sec: 0.5       # 超时后锁止，必须重新经过中档
+    rc_switch_up: 1                  # 上机后可按实际日志调整
+    rc_switch_mid: 3
+    rc_switch_down: 2
+    rc_up_profile: "center"
+    rc_down_profile: "strong"
 
     # 手柄选方案按键映射（Xbox 标准映射：A=0, B=1, X=2, Y=3）
     # 键盘对应：1/2/3/4 键（TODO: 键盘在 Python 层处理或通过 joy2key 转发）
@@ -86,14 +99,14 @@ strike_node:
         strike:
           main:                  # kp=0 纯速度模式
             pos_deg: 0.0
-            vel: 6.5           # 目标速度 (rad/s)  ← 6.0→4.0
+            vel: 4.0           # 目标速度 (rad/s)  ← 6.0→4.0
             torque_ff: 4.5       # 额外加速前馈 (Nm) ← 3.5→1.5
             kp: 0.0
             kd: 0.1
           sub:
             pos_deg: 0.0
-            vel: 5.0
-            torque_ff: 2.0       # ← 3.5→1.5
+            vel: 3.5
+            torque_ff: 3.0       # ← 3.5→1.5
             kp: 0.0
             kd: 0.1
 
