@@ -48,6 +48,7 @@ RCUsbControlNode::RCUsbControlNode()
   last_frame_time_ = now;
   last_vision_cmd_time_ = now;
   last_diagnostics_time_ = now;
+  manual_center_since_ = now;
   rx_buffer_.reserve(4096);
 
   running_ = true;
@@ -97,6 +98,8 @@ void RCUsbControlNode::configureParameters()
   declare_parameter("diagnostics_interval_sec", diagnostics_interval_sec_);
   declare_parameter("vision_timeout", vision_timeout_);
   declare_parameter("serial_stale_reconnect_sec", serial_stale_reconnect_sec_);
+  declare_parameter("manual_unlock_axis_threshold", manual_unlock_axis_threshold_);
+  declare_parameter("manual_unlock_hold_sec", manual_unlock_hold_sec_);
 
   declare_parameter("manual_switch", manual_switch_);
   declare_parameter("estop_switch", estop_switch_);
@@ -107,6 +110,7 @@ void RCUsbControlNode::configureParameters()
   declare_parameter("publish_zero_before_first_frame", publish_zero_before_first_frame_);
   declare_parameter("enable_vision_passthrough", enable_vision_passthrough_);
   declare_parameter("enable_strike_switch_output", enable_strike_switch_output_);
+  declare_parameter("require_manual_center_unlock", require_manual_center_unlock_);
 
   declare_parameter("serial_read_chunk", serial_read_chunk_);
   declare_parameter("serial_reconnect_interval_ms", serial_reconnect_interval_ms_);
@@ -157,6 +161,8 @@ void RCUsbControlNode::configureParameters()
   get_parameter("diagnostics_interval_sec", diagnostics_interval_sec_);
   get_parameter("vision_timeout", vision_timeout_);
   get_parameter("serial_stale_reconnect_sec", serial_stale_reconnect_sec_);
+  get_parameter("manual_unlock_axis_threshold", manual_unlock_axis_threshold_);
+  get_parameter("manual_unlock_hold_sec", manual_unlock_hold_sec_);
 
   get_parameter("manual_switch", manual_switch_);
   get_parameter("estop_switch", estop_switch_);
@@ -167,6 +173,7 @@ void RCUsbControlNode::configureParameters()
   get_parameter("publish_zero_before_first_frame", publish_zero_before_first_frame_);
   get_parameter("enable_vision_passthrough", enable_vision_passthrough_);
   get_parameter("enable_strike_switch_output", enable_strike_switch_output_);
+  get_parameter("require_manual_center_unlock", require_manual_center_unlock_);
 
   get_parameter("serial_read_chunk", serial_read_chunk_);
   get_parameter("serial_reconnect_interval_ms", serial_reconnect_interval_ms_);
@@ -176,6 +183,8 @@ void RCUsbControlNode::configureParameters()
   command_timeout_ = std::max(0.05, command_timeout_);
   vision_timeout_ = std::max(0.05, vision_timeout_);
   serial_stale_reconnect_sec_ = std::max(command_timeout_ + 0.1, serial_stale_reconnect_sec_);
+  manual_unlock_axis_threshold_ = clamp(manual_unlock_axis_threshold_, 0.0, 0.5);
+  manual_unlock_hold_sec_ = clamp(manual_unlock_hold_sec_, 0.1, 3.0);
   deadzone_ = clamp(deadzone_, 0.0, 0.95);
   axis_max_ = std::max(1.0, axis_max_);
   max_linear_velocity_ = std::max(0.0, max_linear_velocity_);
@@ -437,19 +446,53 @@ void RCUsbControlNode::updateCommand(const RcForwardFrame& frame)
   const uint8_t mode_switch = modeSwitchValue(frame);
   const ControlMode mode = modeFromSwitch(mode_switch);
   const geometry_msgs::msg::Twist manual_cmd = commandFromFrame(frame);
+  const auto frame_time = now();
 
   bool log_mode_change = false;
+  bool log_manual_unlock = false;
   ControlMode previous_mode = ControlMode::ESTOP;
   {
     std::lock_guard<std::mutex> lock(command_mutex_);
     log_mode_change = !has_valid_frame_ || mode != control_mode_;
     previous_mode = control_mode_;
+
+    if (mode != ControlMode::MANUAL) {
+      manual_unlocked_ = false;
+      manual_center_tracking_ = false;
+    } else if (!require_manual_center_unlock_) {
+      manual_unlocked_ = true;
+    } else {
+      if (mode != control_mode_) {
+        manual_unlocked_ = false;
+        manual_center_tracking_ = false;
+      }
+
+      if (!manual_unlocked_) {
+        if (manualAxesCentered(frame)) {
+          if (!manual_center_tracking_) {
+            manual_center_tracking_ = true;
+            manual_center_since_ = frame_time;
+          } else if ((frame_time - manual_center_since_).seconds() >= manual_unlock_hold_sec_) {
+            manual_unlocked_ = true;
+            manual_center_tracking_ = false;
+            log_manual_unlock = true;
+          }
+        } else {
+          manual_center_tracking_ = false;
+        }
+      }
+    }
+
     control_mode_ = mode;
     last_manual_cmd_ = manual_cmd;
-    last_frame_time_ = now();
+    last_frame_time_ = frame_time;
     last_seq_ = frame.seq;
     last_sw_left_ = frame.sw_left;
     last_sw_right_ = frame.sw_right;
+    last_lx_ = frame.lx;
+    last_ly_ = frame.ly;
+    last_rx_ = frame.rx;
+    last_ry_ = frame.ry;
     has_valid_frame_ = true;
     ++valid_frames_;
   }
@@ -467,6 +510,11 @@ void RCUsbControlNode::updateCommand(const RcForwardFrame& frame)
       get_logger(), "遥控模式切换: %s -> %s seq=%u mode_sw=%u frame_sw_left=%u frame_sw_right=%u",
       modeName(previous_mode), modeName(mode), frame.seq, mode_switch, frame.sw_left, frame.sw_right);
   }
+  if (log_manual_unlock) {
+    RCLCPP_INFO(
+      get_logger(), "手动档已解锁: 摇杆回中保持 %.2fs, raw(lx/ly/rx/ry)=%d/%d/%d/%d",
+      manual_unlock_hold_sec_, frame.lx, frame.ly, frame.rx, frame.ry);
+  }
 }
 
 void RCUsbControlNode::publishCommand()
@@ -475,6 +523,7 @@ void RCUsbControlNode::publishCommand()
   bool should_publish = true;
   bool timed_out = false;
   bool vision_stale = false;
+  bool manual_locked = false;
   bool estop_active = true;
   uint8_t strike_switch = 0;
 
@@ -494,8 +543,13 @@ void RCUsbControlNode::publishCommand()
       cmd = zeroTwist();
       timed_out = true;
     } else if (control_mode_ == ControlMode::MANUAL) {
-      cmd = last_manual_cmd_;
-      estop_active = false;
+      if (manual_unlocked_) {
+        cmd = last_manual_cmd_;
+        estop_active = false;
+      } else {
+        cmd = zeroTwist();
+        manual_locked = true;
+      }
     } else if (control_mode_ == ControlMode::VISION) {
       estop_active = false;
       const bool have_fresh_vision =
@@ -521,6 +575,11 @@ void RCUsbControlNode::publishCommand()
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "视觉档未收到新视觉速度，底盘零速: topic=%s", vision_cmd_vel_topic_.c_str());
+  }
+  if (manual_locked) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "手动档安全锁定：将 lx/ly/rx 摇杆回中并保持 %.2fs", manual_unlock_hold_sec_);
   }
 
   auto estop_msg = std_msgs::msg::Bool();
@@ -559,7 +618,13 @@ void RCUsbControlNode::logDiagnostics(const rclcpp::Time& now_time)
   uint16_t last_seq = 0;
   uint8_t sw_left = 0;
   uint8_t sw_right = 0;
+  int16_t lx = 0;
+  int16_t ly = 0;
+  int16_t rx = 0;
+  int16_t ry = 0;
   ControlMode mode = ControlMode::ESTOP;
+  geometry_msgs::msg::Twist manual_cmd;
+  bool manual_unlocked = false;
   double frame_age = -1.0;
   bool has_valid_frame = false;
 
@@ -573,7 +638,13 @@ void RCUsbControlNode::logDiagnostics(const rclcpp::Time& now_time)
     last_seq = last_seq_;
     sw_left = last_sw_left_;
     sw_right = last_sw_right_;
+    lx = last_lx_;
+    ly = last_ly_;
+    rx = last_rx_;
+    ry = last_ry_;
     mode = control_mode_;
+    manual_cmd = last_manual_cmd_;
+    manual_unlocked = manual_unlocked_;
     has_valid_frame = has_valid_frame_;
     frame_age = has_valid_frame_ ? (now_time - last_frame_time_).seconds() : -1.0;
   }
@@ -601,9 +672,10 @@ void RCUsbControlNode::logDiagnostics(const rclcpp::Time& now_time)
 
   RCLCPP_INFO(
     get_logger(),
-    "RC 诊断: valid=%lu invalid=%lu dropped=%lu rx_bytes=%lu seq=%u age=%.3fs sw(L/R)=%u/%u mode=%s",
+    "RC 诊断: valid=%lu invalid=%lu dropped=%lu rx_bytes=%lu seq=%u age=%.3fs sw(L/R)=%u/%u mode=%s manual_unlocked=%d raw(lx/ly/rx/ry)=%d/%d/%d/%d cmd(x/y/w)=%.3f/%.3f/%.3f",
     valid_frames, invalid_frames, dropped_bytes, rx_bytes, last_seq, frame_age,
-    sw_left, sw_right, mode_name);
+    sw_left, sw_right, mode_name, manual_unlocked ? 1 : 0,
+    lx, ly, rx, ry, manual_cmd.linear.x, manual_cmd.linear.y, manual_cmd.angular.z);
 }
 
 RCUsbControlNode::ControlMode RCUsbControlNode::modeFromSwitch(uint8_t sw) const
@@ -643,6 +715,14 @@ geometry_msgs::msg::Twist RCUsbControlNode::commandFromFrame(const RcForwardFram
   cmd.linear.y = linear_y;
   cmd.angular.z = angular_z;
   return cmd;
+}
+
+bool RCUsbControlNode::manualAxesCentered(const RcForwardFrame& frame) const
+{
+  const auto centered = [this](int16_t raw) {
+    return std::abs(static_cast<double>(raw) / axis_max_) <= manual_unlock_axis_threshold_;
+  };
+  return centered(frame.lx) && centered(frame.ly) && centered(frame.rx);
 }
 
 geometry_msgs::msg::Twist RCUsbControlNode::zeroTwist() const

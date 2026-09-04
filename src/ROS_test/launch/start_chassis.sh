@@ -62,6 +62,17 @@ echo "设备状态:"
 ls -l /dev/robocon_usb2can 2>/dev/null || echo "  未找到 /dev/robocon_usb2can (USB2CAN, 2e88:4603)"
 ls -l /dev/robocon_rc 2>/dev/null || echo "  未找到 /dev/robocon_rc (STM32 RC CDC, 0483:5740)"
 ls -l /dev/robocon_odom 2>/dev/null || echo "  未找到 /dev/robocon_odom (QinHeng odom, 1a86:7522)"
+
+if [ ! -e /dev/robocon_usb2can ]; then
+  echo "错误: USB2CAN 不存在，拒绝启动底盘"
+  exit 1
+fi
+if [ ! -e /dev/robocon_rc ]; then
+  echo "错误: 遥控接收设备不存在，拒绝启动底盘"
+  echo "请检查 STM32 RC USB 连接和 udev 规则；不要在无遥控急停输入时运行"
+  exit 1
+fi
+
 if [ "$START_MCU_ODOM" = "auto" ]; then
   if [ -e /dev/robocon_odom ]; then
     START_MCU_ODOM=1

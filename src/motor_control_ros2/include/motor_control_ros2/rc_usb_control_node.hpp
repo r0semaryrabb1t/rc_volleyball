@@ -64,6 +64,7 @@ private:
   ControlMode modeFromSwitch(uint8_t sw) const;
   uint8_t modeSwitchValue(const RcForwardFrame& frame) const;
   geometry_msgs::msg::Twist commandFromFrame(const RcForwardFrame& frame) const;
+  bool manualAxesCentered(const RcForwardFrame& frame) const;
   geometry_msgs::msg::Twist zeroTwist() const;
   double normalizeAxis(int16_t raw) const;
   double clamp(double value, double min_value, double max_value) const;
@@ -95,6 +96,8 @@ private:
   double diagnostics_interval_sec_{1.0};
   double vision_timeout_{0.3};
   double serial_stale_reconnect_sec_{2.0};
+  double manual_unlock_axis_threshold_{0.12};
+  double manual_unlock_hold_sec_{0.5};
 
   int manual_switch_{1};
   int estop_switch_{3};
@@ -105,6 +108,7 @@ private:
   bool publish_zero_before_first_frame_{true};
   bool enable_vision_passthrough_{true};
   bool enable_strike_switch_output_{true};
+  bool require_manual_center_unlock_{true};
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_pub_;
@@ -128,6 +132,14 @@ private:
   ControlMode control_mode_{ControlMode::ESTOP};
   bool has_valid_frame_{false};
   bool has_vision_cmd_{false};
+  bool manual_unlocked_{false};
+  bool manual_center_tracking_{false};
+  rclcpp::Time manual_center_since_;
+
+  int16_t last_lx_{0};
+  int16_t last_ly_{0};
+  int16_t last_rx_{0};
+  int16_t last_ry_{0};
 
   uint64_t rx_bytes_{0};
   uint64_t valid_frames_{0};

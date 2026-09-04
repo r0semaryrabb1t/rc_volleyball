@@ -42,6 +42,12 @@ rc_usb_control_node:
     serial_stale_reconnect_sec: 2.0
     publish_zero_before_first_frame: true
 
+    # 左拨杆进入手动档后，三个控制摇杆必须回中并保持一段时间才解除急停。
+    # 避免上电时摇杆未回中、中位漂移或异常轴值导致底盘突然运动。
+    require_manual_center_unlock: true
+    manual_unlock_axis_threshold: 0.12
+    manual_unlock_hold_sec: 0.5
+
     # DJI DBUS 三档拨杆值: UP=1, MID=3, DOWN=2
     # 当前使用物理左拨杆，对应帧内 sw_left 字段。
     # 左拨杆上档: 手动遥控
